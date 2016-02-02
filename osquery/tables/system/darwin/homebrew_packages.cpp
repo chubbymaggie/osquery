@@ -1,34 +1,35 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
+/*
+ *  Copyright (c) 2014, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
 
 #include <boost/algorithm/string/join.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
-#include <boost/lexical_cast.hpp>
 
-#include <glog/logging.h>
+#include <osquery/core.h>
+#include <osquery/filesystem.h>
+#include <osquery/logger.h>
+#include <osquery/tables.h>
 
-#include "osquery/core.h"
-#include "osquery/database.h"
-#include "osquery/filesystem.h"
-
+namespace fs = boost::filesystem;
 namespace pt = boost::property_tree;
 
 namespace osquery {
 namespace tables {
 
-const std::string kHomebrewRoot = "/usr/local/Cellar/";
+const std::string kHomebrewBinary = "/usr/local/bin/brew";
 
-std::vector<std::string> getHomebrewAppInfoPlistPaths() {
+std::vector<std::string> getHomebrewAppInfoPlistPaths(const std::string& root) {
   std::vector<std::string> results;
-
-  std::vector<std::string> homebrew_apps;
-  auto status = osquery::listFilesInDirectory(kHomebrewRoot, homebrew_apps);
-  if (status.ok()) {
-    for (const auto& app_path : homebrew_apps) {
-      results.push_back(app_path);
-    }
-  } else {
-    LOG(ERROR) << "Error listing " << kHomebrewRoot << ": " << status.toString();
+  auto status = osquery::listDirectoriesInDirectory(root, results);
+  if (!status.ok()) {
+    TLOG << "Error listing " << root << ": " << status.toString();
   }
 
   return results;
@@ -42,25 +43,60 @@ std::string getHomebrewNameFromInfoPlistPath(const std::string& path) {
 std::vector<std::string> getHomebrewVersionsFromInfoPlistPath(
     const std::string& path) {
   std::vector<std::string> results;
-
   std::vector<std::string> app_versions;
-  auto status = osquery::listFilesInDirectory(path, app_versions);
+  auto status = osquery::listDirectoriesInDirectory(path, app_versions);
   if (status.ok()) {
-    for (const auto& version_path : app_versions) {
-      auto bits = osquery::split(version_path, "/");
-      results.push_back(bits[bits.size() - 1]);
+    for (const auto& version : app_versions) {
+      results.push_back(fs::path(version).parent_path().filename().string());
     }
   } else {
-    LOG(ERROR) << "Error listing " << path << ": " << status.toString();
+    TLOG << "Error listing " << path << ": " << status.toString();
   }
 
   return results;
 }
 
-QueryData genHomebrewPackages() {
-  QueryData results;
+Status getHomebrewCellar(fs::path& cellarPath) {
+  // The Homebrew wrapper script finds the Library directory by taking the
+  // directory that it is located in and concatenating `/../Library`:
+  //   BREW_FILE_DIRECTORY=$(chdir "${0%/*}" && pwd -P)
+  //   export HOMEBREW_BREW_FILE="$BREW_FILE_DIRECTORY/${0##*/}"
+  // Note that the `-P` flag to pwd resolves all symlinks.
+  //
+  // Next, it will use given filename to find the prefix:
+  //   HOMEBREW_PREFIX = Pathname.new(HOMEBREW_BREW_FILE).dirname.parent
 
-  for (const auto& path : getHomebrewAppInfoPlistPaths()) {
+  if (!pathExists(kHomebrewBinary).ok()) {
+    return Status(1, "No Homebrew binary found");
+  }
+
+  // Get the actual location of the Homebrew binary.
+  // In the future, we could extend this to look at all 'brew' executables in
+  // $PATH and check all of them.
+  auto brewExecutable = fs::canonical(kHomebrewBinary);
+
+  // Note that the first `parent_path` call is to remove the filename, and the
+  // next to actually move up a directory.
+  auto path = brewExecutable.parent_path().parent_path() / "Cellar";
+  if (!pathExists(path).ok()) {
+    return Status(1, "No Homebrew Cellar found");
+  }
+
+  cellarPath = path;
+  return Status(0, "OK");
+}
+
+QueryData genHomebrewPackages(QueryContext& context) {
+  QueryData results;
+  fs::path cellar;
+
+  auto status = getHomebrewCellar(cellar);
+  if (!status.ok()) {
+    TLOG << "Could not list Homebrew packages: " << status.toString();
+    return results;
+  }
+
+  for (const auto& path : getHomebrewAppInfoPlistPaths(cellar.native())) {
     auto versions = getHomebrewVersionsFromInfoPlistPath(path);
     auto name = getHomebrewNameFromInfoPlistPath(path);
     for (const auto& version : versions) {

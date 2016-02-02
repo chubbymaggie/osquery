@@ -3,6 +3,7 @@
 *.lo
 *.o
 *.obj
+*.pyc
 
 # Compiled Dynamic libraries
 *.so
@@ -19,12 +20,15 @@
 *.exe
 *.out
 *.app
+*.pkg
 
 # Build Artifacts
+.provision
 build/
 
 # Run Artifacts
 *.log
+*.orig
 
 # Vagrant Artifacts
 .vagrant
@@ -41,7 +45,13 @@ build/
 .idea/sqlDataSources.xml
 .idea/dynamic.xml
 .idea/dictionaries
+.idea/codeStyleSettings.xml
 
 # Doxygen Documentation
 doxygen/html
 doxygen/latex
+
+# Editors
+*~
+\#*\#
+*.swp

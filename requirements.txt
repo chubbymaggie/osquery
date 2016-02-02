@@ -1,2 +1,7 @@
-# needed for gentable.py
 Jinja2
+psutil
+argparse
+
+# needed for integration tests
+pexpect
+thrift

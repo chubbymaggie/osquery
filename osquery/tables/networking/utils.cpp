@@ -1,4 +1,12 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
+/*
+ *  Copyright (c) 2014, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
 
 #include <iomanip>
 #include <sstream>
@@ -9,7 +17,13 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #define AF_LINK AF_PACKET
-#else
+#elif defined(__FreeBSD__)
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <net/if_dl.h>
+#elif defined(__APPLE__)
 #include <net/if_dl.h>
 #endif
 
@@ -17,10 +31,12 @@
 
 #include "osquery/tables/networking/utils.h"
 
-std::string canonical_ip_address(const struct sockaddr *in) {
-  char dst[INET6_ADDRSTRLEN];
-  memset(dst, 0, sizeof(dst));
-  void *in_addr;
+namespace osquery {
+namespace tables {
+
+std::string ipAsString(const struct sockaddr *in) {
+  char dst[INET6_ADDRSTRLEN] = {0};
+  void *in_addr = nullptr;
 
   if (in->sa_family == AF_INET) {
     in_addr = (void *)&(((struct sockaddr_in *)in)->sin_addr);
@@ -33,7 +49,15 @@ std::string canonical_ip_address(const struct sockaddr *in) {
   inet_ntop(in->sa_family, in_addr, dst, sizeof(dst));
   std::string address(dst);
   boost::trim(address);
+  return address;
+}
 
+std::string ipAsString(const struct in_addr *in) {
+  char dst[INET6_ADDRSTRLEN] = {0};
+
+  inet_ntop(AF_INET, in, dst, sizeof(dst));
+  std::string address(dst);
+  boost::trim(address);
   return address;
 }
 
@@ -52,13 +76,13 @@ int netmaskFromIP(const struct sockaddr *in) {
   int mask = 0;
 
   if (in->sa_family == AF_INET6) {
-    struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)in;
+    auto in6 = (struct sockaddr_in6 *)in;
     for (size_t i = 0; i < 16; i++) {
       mask += addBits(in6->sin6_addr.s6_addr[i]);
     }
   } else {
-    struct sockaddr_in *in4 = (struct sockaddr_in *)in;
-    char *address = reinterpret_cast<char *>(&in4->sin_addr.s_addr);
+    auto in4 = (struct sockaddr_in *)in;
+    auto address = reinterpret_cast<char *>(&in4->sin_addr.s_addr);
     for (size_t i = 0; i < 4; i++) {
       mask += addBits(address[i]);
     }
@@ -67,43 +91,49 @@ int netmaskFromIP(const struct sockaddr *in) {
   return mask;
 }
 
-std::string canonical_mac_address(const struct ifaddrs *addr) {
+inline std::string macAsString(const char *addr) {
   std::stringstream mac;
 
-  if (addr->ifa_addr == NULL) {
+  for (size_t i = 0; i < 6; i++) {
+    mac << std::hex << std::setfill('0') << std::setw(2);
+    mac << (int)((uint8_t)addr[i]);
+    if (i != 5) {
+      mac << ":";
+    }
+  }
+
+  return mac.str();
+}
+
+std::string macAsString(const struct ifaddrs *addr) {
+  static std::string blank_mac = "00:00:00:00:00:00";
+  if (addr->ifa_addr == nullptr) {
     // No link or MAC exists.
-    return "";
+    return blank_mac;
   }
 
 #if defined(__linux__)
   struct ifreq ifr;
+  ifr.ifr_addr.sa_family = AF_INET;
+  memcpy(ifr.ifr_name, addr->ifa_name, IFNAMSIZ);
 
   int socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-
-  ifr.ifr_addr.sa_family = AF_INET;
-  strcpy(ifr.ifr_name, addr->ifa_name);
+  if (socket_fd < 0) {
+    return blank_mac;
+  }
   ioctl(socket_fd, SIOCGIFHWADDR, &ifr);
   close(socket_fd);
 
-  for (size_t i = 0; i < 6; i++) {
-    mac << std::hex << std::setfill('0') << std::setw(2);
-    mac << (int)((uint8_t)ifr.ifr_hwaddr.sa_data[i]) << ":";
-  }
+  return macAsString(ifr.ifr_hwaddr.sa_data);
 #else
-  struct sockaddr_dl *sdl;
-
-  sdl = (struct sockaddr_dl *)addr->ifa_addr;
+  auto sdl = (struct sockaddr_dl *)addr->ifa_addr;
   if (sdl->sdl_alen != 6) {
     // Do not support MAC address that are not 6 bytes...
-    return "";
+    return blank_mac;
   }
 
-  for (size_t i = 0; i < sdl->sdl_alen; i++) {
-    mac << std::hex << std::setfill('0') << std::setw(2);
-    // Prevent char sign extension.
-    mac << (int)((uint8_t)sdl->sdl_data[i + sdl->sdl_nlen]) << ":";
-  }
+  return macAsString(&sdl->sdl_data[sdl->sdl_nlen]);
 #endif
-
-  return mac.str();
+}
+}
 }

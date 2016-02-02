@@ -1,9 +1,0 @@
-table_name("kernel_modules")
-schema([
-    Column(name="name", type="std::string"),
-    Column(name="size", type="std::string"),
-    Column(name="used_by", type="std::string"),
-    Column(name="status", type="std::string"),
-    Column(name="address", type="std::string"),
-])
-implementation("kernel_modules@genKernelModules")

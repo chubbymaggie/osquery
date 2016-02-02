@@ -1,22 +1,22 @@
 if(APPLE)
-  set (OS_CORE_SOURCE darwin/test_util.cpp darwin/test_util.h)
+  set (OS_CORE_SOURCE
+    darwin/conversions.cpp
+  )
 else()
   set (OS_CORE_SOURCE "")
 endif()
 
-ADD_OSQUERY_LIBRARY(osquery_core
-  init_osquery.cpp
-  sql.cpp
-  sqlite_util.cpp
+ADD_OSQUERY_LIBRARY(TRUE osquery_core
+  conversions.cpp
+  init.cpp
   system.cpp
-  test_util.cpp
   ${OS_CORE_SOURCE}
+  tables.cpp
   text.cpp
+  flags.cpp
+  hash.cpp
+  watcher.cpp
 )
 
-ADD_OSQUERY_TEST(status_test status_tests.cpp)
-ADD_OSQUERY_TEST(sql_test sql_tests.cpp)
-ADD_OSQUERY_TEST(sqlite_util_tests sqlite_util_tests.cpp)
-ADD_OSQUERY_TEST(test_util_tests test_util_tests.cpp)
-ADD_OSQUERY_TEST(text_tests text_tests.cpp)
-ADD_OSQUERY_TEST(conversions_tests conversions_tests.cpp)
+file(GLOB OSQUERY_CORE_TESTS "tests/*.cpp")
+ADD_OSQUERY_TEST(TRUE ${OSQUERY_CORE_TESTS})

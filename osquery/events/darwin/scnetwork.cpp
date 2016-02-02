@@ -1,15 +1,23 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
+/*
+ *  Copyright (c) 2014, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
-#include "osquery/events/darwin/scnetwork.h"
+#include <osquery/logger.h>
 
-#include <glog/logging.h>
+#include "osquery/events/darwin/scnetwork.h"
 
 namespace osquery {
 
-REGISTER_EVENTPUBLISHER(SCNetworkEventPublisher);
+REGISTER(SCNetworkEventPublisher, "event_publisher", "scnetwork");
 
 void SCNetworkEventPublisher::tearDown() {
   for (auto target : targets_) {
@@ -23,7 +31,7 @@ void SCNetworkEventPublisher::tearDown() {
   contexts_.clear();
 }
 
-void SCNetworkEventPublisher::Callback(SCNetworkReachabilityRef target,
+void SCNetworkEventPublisher::Callback(const SCNetworkReachabilityRef target,
                                        SCNetworkReachabilityFlags flags,
                                        void* info) {
   auto ec = createEventContext();
@@ -32,15 +40,15 @@ void SCNetworkEventPublisher::Callback(SCNetworkReachabilityRef target,
 }
 
 bool SCNetworkEventPublisher::shouldFire(
-    const SCNetworkSubscriptionContextRef sc,
-    const SCNetworkEventContextRef ec) {
+    const SCNetworkSubscriptionContextRef& sc,
+    const SCNetworkEventContextRef& ec) const {
   // Only fire the event for the subscription context it matched.
   return (sc == ec->subscription);
 }
 
 void SCNetworkEventPublisher::addTarget(
-    const SCNetworkSubscriptionContextRef sc,
-    const SCNetworkReachabilityRef target) {
+    const SCNetworkSubscriptionContextRef& sc,
+    const SCNetworkReachabilityRef& target) {
   targets_.push_back(target);
 
   // Assign a context (the subscription context) to the target.
@@ -55,14 +63,15 @@ void SCNetworkEventPublisher::addTarget(
 }
 
 void SCNetworkEventPublisher::addHostname(
-    const SCNetworkSubscriptionContextRef sc) {
-  auto target = SCNetworkReachabilityCreateWithName(NULL, sc->target.c_str());
+    const SCNetworkSubscriptionContextRef& sc) {
+  auto target =
+      SCNetworkReachabilityCreateWithName(nullptr, sc->target.c_str());
   target_names_.push_back(sc->target);
   addTarget(sc, target);
 }
 
 void SCNetworkEventPublisher::addAddress(
-    const SCNetworkSubscriptionContextRef sc) {
+    const SCNetworkSubscriptionContextRef& sc) {
   struct sockaddr* addr;
   if (sc->family == AF_INET) {
     struct sockaddr_in ipv4_addr;
@@ -76,7 +85,7 @@ void SCNetworkEventPublisher::addAddress(
     addr = (struct sockaddr*)&ip6_addr;
   }
 
-  auto target = SCNetworkReachabilityCreateWithAddress(NULL, addr);
+  auto target = SCNetworkReachabilityCreateWithAddress(nullptr, addr);
   target_addresses_.push_back(sc->target);
   addTarget(sc, target);
 }
@@ -142,7 +151,7 @@ Status SCNetworkEventPublisher::run() {
   CFRunLoopRun();
 
   // Do not expect the run loop to exit often, if so, add artificial latency.
-  ::sleep(1);
+  osquery::publisherSleep(1000);
   return Status(0, "OK");
 }
 };

@@ -1,43 +1,134 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
+/*
+ *  Copyright (c) 2014, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
 
-#include "osquery/core/test_util.h"
-
+#include <chrono>
 #include <deque>
+#include <random>
 #include <sstream>
 
+#include <signal.h>
+#include <time.h>
+
 #include <boost/property_tree/json_parser.hpp>
+#include <boost/filesystem/operations.hpp>
 
-#include <glog/logging.h>
+#include <osquery/filesystem.h>
+#include <osquery/logger.h>
 
-#include "osquery/core/sqlite_util.h"
-#include "osquery/filesystem.h"
+#include "osquery/core/test_util.h"
+#include "osquery/database/db_handle.h"
 
-namespace pt = boost::property_tree;
+namespace fs = boost::filesystem;
 
 namespace osquery {
-namespace core {
+std::string kFakeDirectory = "";
 
-const std::string kTestQuery = "SELECT * FROM test_table";
+#ifdef DARWIN
+std::string kTestWorkingDirectory = "/private/tmp/osquery-tests";
+#else
+std::string kTestWorkingDirectory = "/tmp/osquery-tests";
+#endif
 
-sqlite3* createTestDB() {
-  sqlite3* db = createDB();
-  char* err = nullptr;
-  std::vector<std::string> queries = {
-      "CREATE TABLE test_table ("
-      "username varchar(30) primary key, "
-      "age int"
-      ")",
-      "INSERT INTO test_table VALUES (\"mike\", 23)",
-      "INSERT INTO test_table VALUES (\"matt\", 24)"};
-  for (auto q : queries) {
-    sqlite3_exec(db, q.c_str(), nullptr, nullptr, &err);
-    if (err != nullptr) {
-      LOG(ERROR) << "Error creating test database: " << err;
-      return nullptr;
+/// Most tests will use binary or disk-backed content for parsing tests.
+#ifndef OSQUERY_BUILD_SDK
+std::string kTestDataPath = "../../../tools/tests/";
+#else
+std::string kTestDataPath = "../../../../tools/tests/";
+#endif
+
+DECLARE_string(database_path);
+DECLARE_string(extensions_socket);
+DECLARE_string(modules_autoload);
+DECLARE_string(extensions_autoload);
+DECLARE_string(enroll_tls_endpoint);
+DECLARE_bool(disable_logging);
+
+typedef std::chrono::high_resolution_clock chrono_clock;
+
+void initTesting() {
+  // Allow unit test execution from anywhere in the osquery source/build tree.
+  while (osquery::kTestDataPath != "/") {
+    if (!fs::exists(osquery::kTestDataPath)) {
+      osquery::kTestDataPath =
+          osquery::kTestDataPath.substr(3, osquery::kTestDataPath.size());
+    } else {
+      break;
     }
   }
 
-  return db;
+  // Seed the random number generator, some tests generate temporary files
+  // ports, sockets, etc using random numbers.
+  std::srand(chrono_clock::now().time_since_epoch().count());
+
+  // Set safe default values for path-based flags.
+  // Specific unittests may edit flags temporarily.
+  kTestWorkingDirectory += std::to_string(getuid()) + "/";
+  kFakeDirectory = kTestWorkingDirectory + kFakeDirectoryName;
+
+  fs::remove_all(kTestWorkingDirectory);
+  fs::create_directories(kTestWorkingDirectory);
+  FLAGS_database_path = kTestWorkingDirectory + "unittests.db";
+  FLAGS_extensions_socket = kTestWorkingDirectory + "unittests.em";
+  FLAGS_extensions_autoload = kTestWorkingDirectory + "unittests-ext.load";
+  FLAGS_modules_autoload = kTestWorkingDirectory + "unittests-mod.load";
+  FLAGS_disable_logging = true;
+
+  // Create a default DBHandle instance before unittests.
+  (void)DBHandle::getInstance();
+}
+
+std::map<std::string, std::string> getTestConfigMap() {
+  std::string content;
+  readFile(kTestDataPath + "test_parse_items.conf", content);
+  std::map<std::string, std::string> config;
+  config["awesome"] = content;
+  return config;
+}
+
+pt::ptree getExamplePacksConfig() {
+  std::string content;
+  auto s = readFile(kTestDataPath + "test_inline_pack.conf", content);
+  assert(s.ok());
+  std::stringstream json;
+  json << content;
+  pt::ptree tree;
+  pt::read_json(json, tree);
+  return tree;
+}
+
+/// no discovery queries, no platform restriction
+pt::ptree getUnrestrictedPack() {
+  auto tree = getExamplePacksConfig();
+  auto packs = tree.get_child("packs");
+  return packs.get_child("unrestricted_pack");
+}
+
+/// 1 discovery query, darwin platform restriction
+pt::ptree getPackWithDiscovery() {
+  auto tree = getExamplePacksConfig();
+  auto packs = tree.get_child("packs");
+  return packs.get_child("discovery_pack");
+}
+
+/// 1 discovery query which will always pass
+pt::ptree getPackWithValidDiscovery() {
+  auto tree = getExamplePacksConfig();
+  auto packs = tree.get_child("packs");
+  return packs.get_child("valid_discovery_pack");
+}
+
+/// no discovery queries, no platform restriction, fake version string
+pt::ptree getPackWithFakeVersion() {
+  auto tree = getExamplePacksConfig();
+  auto packs = tree.get_child("packs");
+  return packs.get_child("fake_version_pack");
 }
 
 QueryData getTestDBExpectedResults() {
@@ -105,15 +196,14 @@ std::vector<std::pair<std::string, QueryData> > getTestDBResultStream() {
   return results;
 }
 
-osquery::OsqueryScheduledQuery getOsqueryScheduledQuery() {
-  osquery::OsqueryScheduledQuery q;
-  q.name = "foobartest";
-  q.query = "SELECT filename FROM fs WHERE path = '/bin' ORDER BY filename";
-  q.interval = 5;
-  return q;
+ScheduledQuery getOsqueryScheduledQuery() {
+  ScheduledQuery sq;
+  sq.query = "SELECT filename FROM fs WHERE path = '/bin' ORDER BY filename";
+  sq.interval = 5;
+  return sq;
 }
 
-std::pair<boost::property_tree::ptree, Row> getSerializedRow() {
+std::pair<pt::ptree, Row> getSerializedRow() {
   Row r;
   r["foo"] = "bar";
   r["meaning_of_life"] = "42";
@@ -123,7 +213,7 @@ std::pair<boost::property_tree::ptree, Row> getSerializedRow() {
   return std::make_pair(arr, r);
 }
 
-std::pair<boost::property_tree::ptree, QueryData> getSerializedQueryData() {
+std::pair<pt::ptree, QueryData> getSerializedQueryData() {
   auto r = getSerializedRow();
   QueryData q = {r.second, r.second};
   pt::ptree arr;
@@ -132,7 +222,7 @@ std::pair<boost::property_tree::ptree, QueryData> getSerializedQueryData() {
   return std::make_pair(arr, q);
 }
 
-std::pair<boost::property_tree::ptree, DiffResults> getSerializedDiffResults() {
+std::pair<pt::ptree, DiffResults> getSerializedDiffResults() {
   auto qd = getSerializedQueryData();
   DiffResults diff_results;
   diff_results.added = qd.second;
@@ -145,63 +235,39 @@ std::pair<boost::property_tree::ptree, DiffResults> getSerializedDiffResults() {
   return std::make_pair(root, diff_results);
 }
 
-std::pair<std::string, osquery::DiffResults> getSerializedDiffResultsJSON() {
+std::pair<std::string, DiffResults> getSerializedDiffResultsJSON() {
   auto results = getSerializedDiffResults();
-
   std::ostringstream ss;
   pt::write_json(ss, results.first, false);
-
   return std::make_pair(ss.str(), results.second);
 }
 
-std::pair<pt::ptree, osquery::HistoricalQueryResults>
-getSerializedHistoricalQueryResults() {
-  auto qd = getSerializedQueryData();
-  auto dr = getSerializedDiffResults();
-  HistoricalQueryResults r;
-  r.mostRecentResults.first = 2;
-  r.mostRecentResults.second = qd.second;
-
-  pt::ptree root;
-
-  pt::ptree mostRecentResults;
-  mostRecentResults.add_child("2", qd.first);
-  root.add_child("mostRecentResults", mostRecentResults);
-
-  return std::make_pair(root, r);
-}
-
-std::pair<std::string, osquery::HistoricalQueryResults>
-getSerializedHistoricalQueryResultsJSON() {
-  auto results = getSerializedHistoricalQueryResults();
-
+std::pair<std::string, QueryData> getSerializedQueryDataJSON() {
+  auto results = getSerializedQueryData();
   std::ostringstream ss;
   pt::write_json(ss, results.first, false);
-
   return std::make_pair(ss.str(), results.second);
 }
 
-std::pair<boost::property_tree::ptree, osquery::ScheduledQueryLogItem>
-getSerializedScheduledQueryLogItem() {
-  ScheduledQueryLogItem i;
+std::pair<pt::ptree, QueryLogItem> getSerializedQueryLogItem() {
+  QueryLogItem i;
   pt::ptree root;
   auto dr = getSerializedDiffResults();
-  i.diffResults = dr.second;
+  i.results = dr.second;
   i.name = "foobar";
-  i.calendarTime = "Mon Aug 25 12:10:57 2014";
-  i.unixTime = 1408993857;
-  i.hostname = "foobaz";
+  i.calendar_time = "Mon Aug 25 12:10:57 2014";
+  i.time = 1408993857;
+  i.identifier = "foobaz";
   root.add_child("diffResults", dr.first);
   root.put<std::string>("name", "foobar");
-  root.put<std::string>("hostname", "foobaz");
+  root.put<std::string>("hostIdentifier", "foobaz");
   root.put<std::string>("calendarTime", "Mon Aug 25 12:10:57 2014");
   root.put<int>("unixTime", 1408993857);
   return std::make_pair(root, i);
 }
 
-std::pair<std::string, osquery::ScheduledQueryLogItem>
-getSerializedScheduledQueryLogItemJSON() {
-  auto results = getSerializedScheduledQueryLogItem();
+std::pair<std::string, QueryLogItem> getSerializedQueryLogItemJSON() {
+  auto results = getSerializedQueryLogItem();
 
   std::ostringstream ss;
   pt::write_json(ss, results.first, false);
@@ -226,55 +292,30 @@ std::vector<SplitStringTestData> generateSplitStringTestData() {
 }
 
 std::string getCACertificateContent() {
-  std::string content = R"(
-MIIESzCCAzOgAwIBAgIJAI1bGeY2YPlhMA0GCSqGSIb3DQEBBQUAMIG7MQswCQYD
-VQQGEwItLTESMBAGA1UECAwJU29tZVN0YXRlMREwDwYDVQQHDAhTb21lQ2l0eTEZ
-MBcGA1UECgwQU29tZU9yZ2FuaXphdGlvbjEfMB0GA1UECwwWU29tZU9yZ2FuaXph
-dGlvbmFsVW5pdDEeMBwGA1UEAwwVbG9jYWxob3N0LmxvY2FsZG9tYWluMSkwJwYJ
-KoZIhvcNAQkBFhpyb290QGxvY2FsaG9zdC5sb2NhbGRvbWFpbjAeFw0xNDA4MTkx
-OTEyMTZaFw0xNTA4MTkxOTEyMTZaMIG7MQswCQYDVQQGEwItLTESMBAGA1UECAwJ
-U29tZVN0YXRlMREwDwYDVQQHDAhTb21lQ2l0eTEZMBcGA1UECgwQU29tZU9yZ2Fu
-aXphdGlvbjEfMB0GA1UECwwWU29tZU9yZ2FuaXphdGlvbmFsVW5pdDEeMBwGA1UE
-AwwVbG9jYWxob3N0LmxvY2FsZG9tYWluMSkwJwYJKoZIhvcNAQkBFhpyb290QGxv
-Y2FsaG9zdC5sb2NhbGRvbWFpbjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoC
-ggEBAM6EsaVoMaHrYqH/s4YlhF6ke1XmUhzksB2eqpNqdgZw1JcZi9droRpuYmIf
-bNyvWqUffHW9mKRv+udF5Woueshn+7Kj9YnnL9jfMzFaVEC8WRwWk54RIdNkxgFq
-dqlaiwBWLvZkNUS9k/nugxVTbNu/GTqQlUG1XsIWBDJ2qRqniRfMKrfBKOxPYCZA
-l7KeFguRA+xOsA7/71OMXJZKneMSWN8duTQCFt7uYCQXWc/IV6BfKTaR/ZQQ4w7/
-iEMYPMZPSNprjun7rx0r2zPZGyrkGSCiS+4e+dfy0NbmYXodGHDxb/vBlm4q8CqF
-OoH9aq0F/3581uZcuvU2ydX/LWcCAwEAAaNQME4wHQYDVR0OBBYEFPK5mwDg7mDV
-fEJs4+ZOP9xvZBHAMB8GA1UdIwQYMBaAFPK5mwDg7mDVfEJs4+ZOP9xvZBHAMAwG
-A1UdEwQFMAMBAf8wDQYJKoZIhvcNAQEFBQADggEBAKNNP6f0JKxBtfq8hakrhHyl
-cSN83SmVPcrsTLeaW8w0hi+JOtNOjD9sM8KNSbmLXfhRH4yPqYV+0dpJi5+SeelW
-DjxZwbcFoI4EEu+zqufTUpu0T51eqnGvIedlIu1i2CiaoAJEmAN2OKQuN7uIQW27
-2gL/RS+DVkevaidLRh7q2QI23B0n1XZuyEUiUKB1YfTPrupMZkostuyGybAJaxrc
-ONmxUsB38pWJRCef9N/5APS74uIesfxSvEZXcXfPA+wrQY0yXn+bsEhz9pJOxZvD
-WxULUHBC6qH9gAlKEqZYS3CwpCEl/Blznwi30r4CwwQ6dLfeXoPQDxAt7LyPpV4=
-)";
+  std::string content;
+  readFile(kTestDataPath + "test_cert.pem", content);
   return content;
 }
 
 std::string getEtcHostsContent() {
-  std::string content = R"(
-##
-#Host Database
-#
-#localhost is used to configure the loopback interface
-#when the system is booting.Do not change this entry.
-##
-127.0.0.1       localhost
-255.255.255.255 broadcasthost
-::1             localhost
-fe80::1%lo0     localhost
-)";
+  std::string content;
+  readFile(kTestDataPath + "test_hosts.txt", content);
   return content;
 }
 
-osquery::QueryData getEtcHostsExpectedResults() {
+std::string getEtcProtocolsContent() {
+  std::string content;
+  readFile(kTestDataPath + "test_protocols.txt", content);
+  return content;
+}
+
+QueryData getEtcHostsExpectedResults() {
   Row row1;
   Row row2;
   Row row3;
   Row row4;
+  Row row5;
+  Row row6;
 
   row1["address"] = "127.0.0.1";
   row1["hostnames"] = "localhost";
@@ -284,7 +325,109 @@ osquery::QueryData getEtcHostsExpectedResults() {
   row3["hostnames"] = "localhost";
   row4["address"] = "fe80::1%lo0";
   row4["hostnames"] = "localhost";
-  return {row1, row2, row3, row4};
+  row5["address"] = "127.0.0.1";
+  row5["hostnames"] = "example.com example";
+  row6["address"] = "127.0.0.1";
+  row6["hostnames"] = "example.net";
+  return {row1, row2, row3, row4, row5, row6};
 }
+
+::std::ostream& operator<<(::std::ostream& os, const Status& s) {
+  return os << "Status(" << s.getCode() << ", \"" << s.getMessage() << "\")";
+}
+
+QueryData getEtcProtocolsExpectedResults() {
+  Row row1;
+  Row row2;
+  Row row3;
+
+  row1["name"] = "ip";
+  row1["number"] = "0";
+  row1["alias"] = "IP";
+  row1["comment"] = "internet protocol, pseudo protocol number";
+  row2["name"] = "icmp";
+  row2["number"] = "1";
+  row2["alias"] = "ICMP";
+  row2["comment"] = "internet control message protocol";
+  row3["name"] = "tcp";
+  row3["number"] = "6";
+  row3["alias"] = "TCP";
+  row3["comment"] = "transmission control protocol";
+
+  return {row1, row2, row3};
+}
+
+void createMockFileStructure() {
+  fs::create_directories(kFakeDirectory + "/deep11/deep2/deep3/");
+  fs::create_directories(kFakeDirectory + "/deep1/deep2/");
+  writeTextFile(kFakeDirectory + "/root.txt", "root");
+  writeTextFile(kFakeDirectory + "/door.txt", "toor");
+  writeTextFile(kFakeDirectory + "/roto.txt", "roto");
+  writeTextFile(kFakeDirectory + "/deep1/level1.txt", "l1");
+  writeTextFile(kFakeDirectory + "/deep11/not_bash", "l1");
+  writeTextFile(kFakeDirectory + "/deep1/deep2/level2.txt", "l2");
+
+  writeTextFile(kFakeDirectory + "/deep11/level1.txt", "l1");
+  writeTextFile(kFakeDirectory + "/deep11/deep2/level2.txt", "l2");
+  writeTextFile(kFakeDirectory + "/deep11/deep2/deep3/level3.txt", "l3");
+
+  boost::system::error_code ec;
+  fs::create_symlink(
+      kFakeDirectory + "/root.txt", kFakeDirectory + "/root2.txt", ec);
+}
+
+void tearDownMockFileStructure() {
+  boost::filesystem::remove_all(kFakeDirectory);
+}
+
+void TLSServerRunner::start() {
+  auto& self = instance();
+  if (self.server_ != 0) {
+    return;
+  }
+
+  // Pick a port in an ephemeral range at random.
+  self.port_ = std::to_string(rand() % 10000 + 20000);
+
+  // Fork then exec a shell.
+  self.server_ = fork();
+  if (self.server_ == 0) {
+    // Start a python TLS/HTTPS or HTTP server.
+    auto script = kTestDataPath + "/test_http_server.py --tls " + self.port_;
+    execlp("sh", "sh", "-c", script.c_str(), nullptr);
+    ::exit(0);
+  }
+  ::sleep(1);
+}
+
+void TLSServerRunner::setClientConfig() {
+  auto& self = instance();
+
+  self.tls_hostname_ = Flag::getValue("tls_hostname");
+  Flag::updateValue("tls_hostname", "localhost:" + port());
+
+  self.enroll_tls_endpoint_ = Flag::getValue("enroll_tls_endpoint");
+  Flag::updateValue("enroll_tls_endpoint", "/enroll");
+
+  self.tls_server_certs_ = Flag::getValue("tls_server_certs");
+  Flag::updateValue("tls_server_certs", kTestDataPath + "/test_server_ca.pem");
+
+  self.enroll_secret_path_ = Flag::getValue("enroll_secret_path");
+  Flag::updateValue("enroll_secret_path",
+                    kTestDataPath + "/test_enroll_secret.txt");
+}
+
+void TLSServerRunner::unsetClientConfig() {
+  auto& self = instance();
+  Flag::updateValue("tls_hostname", self.tls_hostname_);
+  Flag::updateValue("enroll_tls_endpoint", self.enroll_tls_endpoint_);
+  Flag::updateValue("tls_server_certs", self.tls_server_certs_);
+  Flag::updateValue("enroll_secret_path", self.enroll_secret_path_);
+}
+
+void TLSServerRunner::stop() {
+  auto& self = instance();
+  kill(self.server_, SIGTERM);
+  self.server_ = 0;
 }
 }

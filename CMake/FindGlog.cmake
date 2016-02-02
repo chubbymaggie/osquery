@@ -1,49 +1,38 @@
-
-# - Try to find Glog
-#
-# The following variables are optionally searched for defaults
-#  GLOG_ROOT_DIR:            Base directory where all GLOG components are found
-#
-# The following are set after configuration is done:
-#  GLOG_FOUND
-#  GLOG_INCLUDE_DIRS
-#  GLOG_LIBRARIES
-#  GLOG_LIBRARYRARY_DIRS
-
 include(FindPackageHandleStandardArgs)
-
-set(GLOG_ROOT_DIR "" CACHE PATH "Folder contains Google glog")
-
-if(WIN32)
-    find_path(GLOG_INCLUDE_DIR glog/logging.h
-        PATHS ${GLOG_ROOT_DIR}/src/windows)
-else()
-    find_path(GLOG_INCLUDE_DIR glog/logging.h
-        PATHS ${GLOG_ROOT_DIR})
+if(POLICY CMP0054)
+  cmake_policy(SET CMP0054 NEW)
 endif()
 
-if(MSVC)
-    find_library(GLOG_LIBRARY_RELEASE libglog_static
-        PATHS ${GLOG_ROOT_DIR}
-        PATH_SUFFIXES Release)
+set(GLOG_ROOT_DIR "${CMAKE_BINARY_DIR}/third-party/glog")
+set(GLOG_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third-party/glog")
 
-    find_library(GLOG_LIBRARY_DEBUG libglog_static
-        PATHS ${GLOG_ROOT_DIR}
-        PATH_SUFFIXES Debug)
-
-    set(GLOG_LIBRARY optimized ${GLOG_LIBRARY_RELEASE} debug ${GLOG_LIBRARY_DEBUG})
-else()
-    find_library(GLOG_LIBRARY glog
-        PATHS ${GLOG_ROOT_DIR}
-        PATH_SUFFIXES
-            lib
-            lib64)
+set(GLOG_C_FLAGS "${CMAKE_C_FLAGS} ${C_COMPILE_FLAGS}")
+if(APPLE)
+  set(GLOG_C_FLAGS "${GLOG_C_FLAGS} -mmacosx-version-min=${OSX_VERSION_MIN}")
 endif()
+set(GLOG_CXX_FLAGS "${GLOG_C_FLAGS} ${CMAKE_CXX_FLAGS} ${CXX_COMPILE_FLAGS}")
+set(GLOG_CXX_FLAGS "${GLOG_CXX_FLAGS} -Wno-deprecated-register -Wno-unnamed-type-template-args -Wno-deprecated -Wno-error")
 
-find_package_handle_standard_args(GLOG DEFAULT_MSG
-    GLOG_INCLUDE_DIR GLOG_LIBRARY)
+set(GLOG_INCLUDE_DIR "${GLOG_ROOT_DIR}/include")
+set(GLOG_INCLUDE_DIRS ${GLOG_INCLUDE_DIR})
 
-if(GLOG_FOUND)
-    set(GLOG_INCLUDE_DIRS ${GLOG_INCLUDE_DIR})
-    set(GLOG_LIBRARIES ${GLOG_LIBRARY})
-endif()
+set(GLOG_LIBRARY "${GLOG_ROOT_DIR}/lib/libglog.a")
+set(GLOG_LIBRARIES ${GLOG_LIBRARY})
+
+INCLUDE(ExternalProject)
+ExternalProject_Add(
+  libglog
+  SOURCE_DIR ${GLOG_SOURCE_DIR}
+  INSTALL_DIR ${GLOG_ROOT_DIR}
+  CONFIGURE_COMMAND ${GLOG_SOURCE_DIR}/configure
+    CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER}
+    CFLAGS=${GLOG_C_FLAGS} CXXFLAGS=${GLOG_CXX_FLAGS}
+    --enable-frame-pointers --enable-shared=no --prefix=${GLOG_ROOT_DIR}
+  BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+  INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} install
+  LOG_CONFIGURE ON
+  LOG_INSTALL ON
+  LOG_BUILD ON
+)
+
+LOG_LIBRARY(glog "${GLOG_LIBRARY}")

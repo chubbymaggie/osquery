@@ -1,66 +1,116 @@
 if(APPLE)
-  ADD_OSQUERY_OBJCXX_LIBRARY(osquery_tables_objc
-    ../core/darwin/NSProcessInfo+PECocoaBackports.mm
-    ../core/darwin/NSProcessInfo+PECocoaBackports.h
-    ../core/darwin/PECocoaBackportsGlobal.h
-    system/darwin/osx_version.mm
-    system/darwin/users.mm
-    system/darwin/groups.mm
+  file(GLOB OSQUERY_OBJC_TABLES "*/darwin/*.mm")
+  ADD_OSQUERY_OBJCXX_LIBRARY_ADDITIONAL(osquery_tables_objc
+    ${OSQUERY_OBJC_TABLES}
   )
 
-  ADD_OSQUERY_LIBRARY(osquery_tables_darwin
-    events/darwin/passwd_changes.cpp
-    networking/darwin/interfaces.cpp
-    networking/darwin/listening_ports.cpp
-    networking/darwin/routes.cpp
-    system/darwin/apps.cpp
-    system/darwin/ca_certs.cpp
-    system/darwin/firewall.h
-    system/darwin/firewall.cpp
-    system/darwin/homebrew_packages.cpp
-    system/darwin/kextstat.cpp
-    system/darwin/launchd.cpp
-    system/darwin/nvram.cpp
-    system/darwin/processes.cpp
+  file(GLOB OSQUERY_DARWIN_TABLES "*/darwin/*.cpp")
+  ADD_OSQUERY_LIBRARY_ADDITIONAL(osquery_tables_darwin
+    ${OSQUERY_DARWIN_TABLES}
   )
 
-  ADD_OSQUERY_LINK("-framework Foundation")
-  ADD_OSQUERY_LINK("-framework IOKit")
-  ADD_OSQUERY_LINK("-framework CoreFoundation")
-  ADD_OSQUERY_LINK("-framework Security")
-  ADD_OSQUERY_LINK("-framework OpenDirectory")
+  file(GLOB OSQUERY_DARWIN_TABLES_TESTS "*/darwin/tests/*.cpp" "*/darwin/tests/*.mm")
+  ADD_OSQUERY_TABLE_TEST(${OSQUERY_DARWIN_TABLES_TESTS})
+
+  ADD_OSQUERY_LINK_ADDITIONAL("-framework CoreFoundation")
+  ADD_OSQUERY_LINK_ADDITIONAL("-framework Security")
+  ADD_OSQUERY_LINK_ADDITIONAL("-framework OpenDirectory")
+  ADD_OSQUERY_LINK_ADDITIONAL("-framework DiskArbitration")
+
+  ADD_OSQUERY_LINK_ADDITIONAL("archive")
+  ADD_OSQUERY_LINK_ADDITIONAL("magic")
+  ADD_OSQUERY_LINK_ADDITIONAL("tsk")
+elseif(FREEBSD)
+  file(GLOB OSQUERY_FREEBSD_TABLES "*/freebsd/*.cpp")
+  ADD_OSQUERY_LIBRARY_ADDITIONAL(osquery_tables_freebsd
+    ${OSQUERY_FREEBSD_TABLES}
+  )
+
+  file(GLOB OSQUERY_FREEBSD_TABLES_TESTS "*/freebsd/tests/*.cpp")
+  ADD_OSQUERY_TABLE_TEST(${OSQUERY_FREEBSD_TABLES_TESTS})
+
+  ADD_OSQUERY_LINK_ADDITIONAL("procstat")
+  ADD_OSQUERY_LINK_ADDITIONAL("util")
+  ADD_OSQUERY_LINK_ADDITIONAL("kvm")
+  ADD_OSQUERY_LINK_ADDITIONAL("elf")
+  ADD_OSQUERY_LINK_ADDITIONAL("magic")
 else()
-  ADD_OSQUERY_LIBRARY(osquery_tables_linux
-    events/linux/passwd_changes.cpp
-    networking/linux/routes.cpp
-    system/linux/kernel_modules.cpp
-    system/linux/processes.cpp
-    system/linux/users.cpp
-    system/linux/groups.cpp
+  file(GLOB OSQUERY_LINUX_TABLES "*/linux/*.cpp")
+  ADD_OSQUERY_LIBRARY_ADDITIONAL(osquery_tables_linux
+    ${OSQUERY_LINUX_TABLES}
   )
+
+  file(GLOB OSQUERY_LINUX_TABLES_TESTS "*/linux/tests/*.cpp")
+  ADD_OSQUERY_TABLE_TEST(${OSQUERY_LINUX_TABLES_TESTS})
+
+  if(CENTOS OR RHEL OR AMAZON)
+    # CentOS specific tables
+    file(GLOB OSQUERY_REDHAT_TABLES "*/centos/*.cpp")
+    ADD_OSQUERY_LIBRARY_ADDITIONAL(osquery_tables_redhat
+      ${OSQUERY_REDHAT_TABLES}
+    )
+
+    ADD_OSQUERY_LINK_ADDITIONAL("rpm rpmio")
+  elseif(UBUNTU)
+    # Ubuntu specific tables
+    file(GLOB OSQUERY_UBUNTU_TABLES "*/ubuntu/*.cpp")
+    ADD_OSQUERY_LIBRARY_ADDITIONAL(osquery_tables_ubuntu
+      ${OSQUERY_UBUNTU_TABLES}
+    )
+
+	# libdpkg API is volitile and suffers breaking changes. We need to find and pass in the libdpkg
+	# version via pkg-config
+	find_package(Libdpkg REQUIRED)
+	add_definitions(-DLIBDPKG_VERSION=${LIBDPKG_VERSION_NUMBER})
+
+    ADD_OSQUERY_LINK_ADDITIONAL("apt-pkg dpkg")
+  endif()
+
+  ADD_OSQUERY_LINK_ADDITIONAL("blkid")
+  ADD_OSQUERY_LINK_ADDITIONAL("cryptsetup libdevmapper.so libgcrypt.so")
+  ADD_OSQUERY_LINK_ADDITIONAL("libuuid.so")
+  ADD_OSQUERY_LINK_ADDITIONAL("ip4tc")
+  ADD_OSQUERY_LINK_ADDITIONAL("libmagic.so")
+  ADD_OSQUERY_LINK_ADDITIONAL("tsk")
 endif()
 
-FILE(GLOB table_sources
-  "generated/*.cpp"
-  "manual/*.cpp"
+file(GLOB OSQUERY_CROSS_APPLICATIONS_TABLES "applications/*.cpp")
+file(GLOB OSQUERY_CROSS_SYSTEM_TABLES "system/*.cpp")
+file(GLOB OSQUERY_CROSS_NETWORKING_TABLES "networking/*.cpp")
+file(GLOB OSQUERY_CROSS_FORENSIC_TABLES "forensic/*.cpp")
+if(APPLE OR LINUX)
+  file(GLOB OSQUERY_CROSS_EVENTS_TABLES "events/*.cpp")
+else()
+  set(OSQUERY_CROSS_EVENTS_TABLES "")
+endif()
+ADD_OSQUERY_LIBRARY_ADDITIONAL(osquery_tables
+  ${OSQUERY_CROSS_APPLICATIONS_TABLES}
+  ${OSQUERY_CROSS_SYSTEM_TABLES}
+  ${OSQUERY_CROSS_NETWORKING_TABLES}
+  ${OSQUERY_CROSS_EVENTS_TABLES}
+  ${OSQUERY_CROSS_FORENSIC_TABLES}
 )
 
-ADD_OSQUERY_LIBRARY(osquery_tables
-  networking/utils.cpp
-  networking/etc_hosts.cpp
-  utility/time.cpp
-  utility/crontab.cpp
-  system/cpuid.cpp
-  system/last.cpp
-  system/bash_history.cpp
-  system/suid_bin.cpp
-  base.h
+file(GLOB OSQUERY_CROSS_TABLES_TESTS "[!uo]*/tests/*/*.cpp")
+file(GLOB OSQUERY_CATEGORY_TABLE_TESTS "[!uo]*/tests/*.cpp")
+file(GLOB OSQUERY_TABLE_TESTS "tests/*.cpp")
+ADD_OSQUERY_TABLE_TEST(
+  ${OSQUERY_CROSS_TABLES_TESTS}
+  ${OSQUERY_CATEGORY_TABLE_TESTS}
+  ${OSQUERY_TABLE_TESTS}
 )
 
-ADD_OSQUERY_TEST(etc_hosts_tests networking/etc_hosts_tests.cpp)
-if(APPLE)
-  ADD_OSQUERY_TEST(apps_tests system/darwin/apps_tests.cpp)
-  ADD_OSQUERY_TEST(ca_certs_tests system/darwin/ca_certs_tests.cpp)
-  ADD_OSQUERY_TEST(firewall_tests system/darwin/firewall_tests.cpp)
-  ADD_OSQUERY_TEST(launchd_tests system/darwin/launchd_tests.cpp)
+file(GLOB OSQUERY_UTILITY_TABLES "utility/*.cpp")
+ADD_OSQUERY_LIBRARY_CORE(osquery_tables_utility
+  ${OSQUERY_UTILITY_TABLES}
+)
+
+if(NOT FREEBSD)
+  file(GLOB OSQUERY_UTILS "other/*.cpp")
+  ADD_OSQUERY_LIBRARY_ADDITIONAL(osquery_utils
+    ${OSQUERY_UTILS}
+  )
+
+  file(GLOB OSQUERY_UTILS_TESTS "other/tests/*.cpp")
+  ADD_OSQUERY_TEST_ADDITIONAL(${OSQUERY_UTILS_TESTS})
 endif()

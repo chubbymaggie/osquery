@@ -1,17 +1,28 @@
 if(APPLE)
-  ADD_OSQUERY_OBJCXX_LIBRARY(osquery_filesystem_objc
+  ADD_OSQUERY_OBJCXX_LIBRARY(TRUE osquery_filesystem_objc
     darwin/plist.mm
   )
 
-  ADD_OSQUERY_LINK("-framework Foundation")
+  ADD_OSQUERY_LINK(TRUE "-framework Foundation")
+elseif(FREEBSD)
+elseif(LINUX)
+  ADD_OSQUERY_LIBRARY(TRUE osquery_filesystem_linux
+    linux/mem.cpp
+    linux/proc.cpp
+  )
 endif()
 
-ADD_OSQUERY_LIBRARY(osquery_filesystem
+ADD_OSQUERY_LIBRARY(TRUE osquery_filesystem
   filesystem.cpp
 )
 
-ADD_OSQUERY_TEST(filesystem_tests filesystem_tests.cpp)
+file(GLOB OSQUERY_FILESYSTEM_TESTS "tests/*.cpp")
+ADD_OSQUERY_TEST(TRUE ${OSQUERY_FILESYSTEM_TESTS})
+
 if(APPLE)
-  ADD_OSQUERY_TEST(plist_tests darwin/plist_tests.cpp)
-  ADD_OSQUERY_TEST(plist_benchmark darwin/plist_benchmark.cpp)
+  file(GLOB OSQUERY_DARWIN_FILESYSTEM_TESTS "darwin/tests/*.cpp")
+  ADD_OSQUERY_TEST(TRUE ${OSQUERY_DARWIN_FILESYSTEM_TESTS})
+
+  file(GLOB OSQUERY_DARWIN_FILESYSTEM_BENCHMARKS "darwin/benchmarks/*.cpp")
+  ADD_OSQUERY_BENCHMARK(${OSQUERY_DARWIN_FILESYSTEM_BENCHMARKS})
 endif()

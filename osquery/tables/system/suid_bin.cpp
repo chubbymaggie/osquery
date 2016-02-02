@@ -1,67 +1,131 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
+/*
+ *  Copyright (c) 2014, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
 
-#include <ctime>
 #include <pwd.h>
 #include <grp.h>
 #include <sys/stat.h>
-#include <boost/lexical_cast.hpp>
-#include <boost/filesystem.hpp>
-#include "osquery/database.h"
 
-using std::string;
-using boost::lexical_cast;
+#include <boost/filesystem.hpp>
+
+#include <osquery/filesystem.h>
+#include <osquery/logger.h>
+#include <osquery/tables.h>
+
+namespace fs = boost::filesystem;
 
 namespace osquery {
 namespace tables {
 
-QueryData genSuidBin() {
-  Row r;
-  QueryData results;
+std::vector<std::string> kBinarySearchPaths = {
+  "/bin",
+  "/sbin",
+  "/usr/bin",
+  "/usr/sbin",
+  "/usr/local/bin",
+  "/usr/local/sbin",
+  "/tmp",
+};
+
+Status genBin(const fs::path& path, int perms, QueryData& results) {
   struct stat info;
+  // store user and group
+  if (stat(path.c_str(), &info) != 0) {
+    return Status(1, "stat failed");
+  }
 
-  boost::filesystem::recursive_directory_iterator it =
-      boost::filesystem::recursive_directory_iterator(
-          boost::filesystem::path("/"));
-  boost::filesystem::recursive_directory_iterator end;
+  // store path
+  Row r;
+  r["path"] = path.string();
+  struct passwd *pw = getpwuid(info.st_uid);
+  struct group *gr = getgrgid(info.st_gid);
 
+  // get user name + group
+  std::string user;
+  if (pw != nullptr) {
+    user = std::string(pw->pw_name);
+  } else {
+    user = boost::lexical_cast<std::string>(info.st_uid);
+  }
+
+  std::string group;
+  if (gr != nullptr) {
+    group = std::string(gr->gr_name);
+  } else {
+    group = boost::lexical_cast<std::string>(info.st_gid);
+  }
+
+  r["username"] = user;
+  r["groupname"] = group;
+
+  r["permissions"] = "";
+  if ((perms & 04000) == 04000) {
+    r["permissions"] += "S";
+  }
+
+  if ((perms & 02000) == 02000) {
+    r["permissions"] += "G";
+  }
+
+  results.push_back(r);
+  return Status(0, "OK");
+}
+
+bool isSuidBin(const fs::path& path, int perms) {
+  if (!fs::is_regular_file(path)) {
+    return false;
+  }
+
+  if ((perms & 04000) == 04000 || (perms & 02000) == 02000) {
+    return true;
+  }
+  return false;
+}
+
+void genSuidBinsFromPath(const std::string& path, QueryData& results) {
+  if (!pathExists(path).ok()) {
+    // Creating an iterator on a missing path will except.
+    return;
+  }
+
+  auto it = fs::recursive_directory_iterator(fs::path(path));
+  fs::recursive_directory_iterator end;
   while (it != end) {
-    boost::filesystem::path path = *it;
+    fs::path path = *it;
     try {
-      if (boost::filesystem::is_regular_file(path) &&
-          ((it.status().permissions() & 04000) == 04000 ||
-           (it.status().permissions() & 02000) == 02000)) {
-        // store path
-        r["path"] = boost::lexical_cast<std::string>(path);
-
-        // store user and group
-        if (stat(path.c_str(), &info) == 0) {
-          struct passwd *pw = getpwuid(info.st_uid);
-          struct group *gr = getgrgid(info.st_gid);
-          // get user name
-          r["unix_user"] = pw ? boost::lexical_cast<std::string>(pw->pw_name)
-                              : boost::lexical_cast<std::string>(info.st_uid);
-          // get group
-          r["unix_group"] = gr ? boost::lexical_cast<std::string>(gr->gr_name)
-                               : boost::lexical_cast<std::string>(info.st_gid);
-
-          // get permission
-          r["permissions"] = "";
-          r["permissions"] +=
-              (it.status().permissions() & 04000) == 04000 ? "S" : "";
-          r["permissions"] +=
-              (it.status().permissions() & 02000) == 02000 ? "G" : "";
-
-          results.push_back(r);
-        }
+      // Do not traverse symlinked directories.
+      if (fs::is_directory(path) && fs::is_symlink(path)) {
+        it.no_push();
       }
-    } catch (...) {
-      // handle invalid files like /dev/fd/3
+
+      int perms = it.status().permissions();
+      if (isSuidBin(path, perms)) {
+        // Only emit suid bins.
+        genBin(path, perms, results);
+      }
+
+      ++it;
+    } catch (fs::filesystem_error& e) {
+      VLOG(1) << "Cannot read binary from " << path;
+      it.no_push();
+      // Try to recover, otherwise break.
+      try { ++it; } catch(fs::filesystem_error& e) { break; }
     }
-    try {
-      ++it; 
-    } catch (std::exception &ex) {
-      it.no_push(); // handle permission error.
-    }
+  }
+}
+
+QueryData genSuidBin(QueryContext& context) {
+  QueryData results;
+
+  // Todo: add hidden column to select on that triggers non-std path searches.
+  for (const auto& path : kBinarySearchPaths) {
+    genSuidBinsFromPath(path, results);
   }
 
   return results;

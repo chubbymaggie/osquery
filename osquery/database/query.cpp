@@ -1,48 +1,41 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
-
-#include "osquery/database/query.h"
+/*
+ *  Copyright (c) 2014, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
 
 #include <algorithm>
 
-using osquery::Status;
+#include "osquery/database/query.h"
 
 namespace osquery {
-
-const std::string kQueryNameNotFoundError = "query name not found in database";
-
-/////////////////////////////////////////////////////////////////////////////
-// Getters and setters
-/////////////////////////////////////////////////////////////////////////////
-
-std::string Query::getQuery() { return query_.query; }
-
-std::string Query::getQueryName() { return query_.name; }
-
-int Query::getInterval() { return query_.interval; }
 
 /////////////////////////////////////////////////////////////////////////////
 // Data access methods
 /////////////////////////////////////////////////////////////////////////////
 
-Status Query::getHistoricalQueryResults(HistoricalQueryResults& hQR) {
-  return getHistoricalQueryResults(hQR, DBHandle::getInstance());
+Status Query::getPreviousQueryResults(QueryData& results) {
+  return getPreviousQueryResults(results, DBHandle::getInstance());
 }
 
-Status Query::getHistoricalQueryResults(HistoricalQueryResults& hQR,
-                                        std::shared_ptr<DBHandle> db) {
-  if (isQueryNameInDatabase()) {
-    std::string raw;
-    auto get_status = db->Get(kQueries, query_.name, raw);
-    if (get_status.ok()) {
-      auto deserialize_status = deserializeHistoricalQueryResultsJSON(raw, hQR);
-      if (!deserialize_status.ok()) {
-        return deserialize_status;
-      }
-    } else {
-      return get_status;
-    }
-  } else {
-    return Status(1, kQueryNameNotFoundError);
+Status Query::getPreviousQueryResults(QueryData& results, DBHandleRef db) {
+  if (!isQueryNameInDatabase()) {
+    return Status(0, "Query name not found in database");
+  }
+
+  std::string raw;
+  auto status = db->Get(kQueries, name_, raw);
+  if (!status.ok()) {
+    return status;
+  }
+
+  status = deserializeQueryDataJSON(raw, results);
+  if (!status.ok()) {
+    return status;
   }
   return Status(0, "OK");
 }
@@ -51,8 +44,7 @@ std::vector<std::string> Query::getStoredQueryNames() {
   return getStoredQueryNames(DBHandle::getInstance());
 }
 
-std::vector<std::string> Query::getStoredQueryNames(
-    std::shared_ptr<DBHandle> db) {
+std::vector<std::string> Query::getStoredQueryNames(DBHandleRef db) {
   std::vector<std::string> results;
   db->Scan(kQueries, results);
   return results;
@@ -62,65 +54,54 @@ bool Query::isQueryNameInDatabase() {
   return isQueryNameInDatabase(DBHandle::getInstance());
 }
 
-bool Query::isQueryNameInDatabase(std::shared_ptr<DBHandle> db) {
+bool Query::isQueryNameInDatabase(DBHandleRef db) {
   auto names = Query::getStoredQueryNames(db);
-  return std::find(names.begin(), names.end(), query_.name) != names.end();
+  return std::find(names.begin(), names.end(), name_) != names.end();
 }
 
-Status Query::addNewResults(const osquery::QueryData& qd, int unix_time) {
-  return addNewResults(qd, unix_time, DBHandle::getInstance());
+Status Query::addNewResults(const osquery::QueryData& qd) {
+  return addNewResults(qd, DBHandle::getInstance());
 }
 
-Status Query::addNewResults(const QueryData& qd,
-                            int unix_time,
-                            std::shared_ptr<DBHandle> db) {
+Status Query::addNewResults(const QueryData& qd, DBHandleRef db) {
   DiffResults dr;
-  return addNewResults(qd, dr, false, unix_time, db);
+  return addNewResults(qd, dr, false, db);
 }
 
-osquery::Status Query::addNewResults(const osquery::QueryData& qd,
-                                     osquery::DiffResults& dr,
-                                     int unix_time) {
-  return addNewResults(qd, dr, true, unix_time, DBHandle::getInstance());
+Status Query::addNewResults(const QueryData& qd, DiffResults& dr) {
+  return addNewResults(qd, dr, true, DBHandle::getInstance());
 }
 
-osquery::Status Query::addNewResults(const osquery::QueryData& qd,
-                                     osquery::DiffResults& dr,
-                                     bool calculate_diff,
-                                     int unix_time,
-                                     std::shared_ptr<DBHandle> db) {
-  HistoricalQueryResults hQR;
-  auto hqr_status = getHistoricalQueryResults(hQR, db);
-  if (!hqr_status.ok() && hqr_status.toString() != kQueryNameNotFoundError) {
-    return hqr_status;
+Status Query::addNewResults(const QueryData& current_qd,
+                            DiffResults& dr,
+                            bool calculate_diff,
+                            DBHandleRef db) {
+  // Get the rows from the last run of this query name.
+  QueryData previous_qd;
+  auto status = getPreviousQueryResults(previous_qd);
+  if (!status.ok()) {
+    return status;
   }
+
+  // Calculate the differential between previous and current query results.
   if (calculate_diff) {
-    dr = diff(hQR.mostRecentResults.second, qd);
+    dr = diff(previous_qd, current_qd);
   }
-  hQR.mostRecentResults.first = unix_time;
-  hQR.mostRecentResults.second = qd;
-  std::string json;
-  auto serialize_status = serializeHistoricalQueryResultsJSON(hQR, json);
-  if (!serialize_status.ok()) {
-    return serialize_status;
-  }
-  auto put_status = db->Put(kQueries, query_.name, json);
-  if (!put_status.ok()) {
-    return put_status;
+
+  if (previous_qd.size() == 0 || dr.added.size() != 0 ||
+      dr.removed.size() != 0) {
+    // Replace the "previous" query data with the current.
+    std::string json;
+    status = serializeQueryDataJSON(current_qd, json);
+    if (!status.ok()) {
+      return status;
+    }
+
+    status = db->Put(kQueries, name_, json);
+    if (!status.ok()) {
+      return status;
+    }
   }
   return Status(0, "OK");
-}
-
-osquery::Status Query::getCurrentResults(osquery::QueryData& qd) {
-  return getCurrentResults(qd, DBHandle::getInstance());
-}
-
-Status Query::getCurrentResults(QueryData& qd, std::shared_ptr<DBHandle> db) {
-  HistoricalQueryResults hQR;
-  auto s = getHistoricalQueryResults(hQR, db);
-  if (s.ok()) {
-    qd = hQR.mostRecentResults.second;
-  }
-  return s;
 }
 }

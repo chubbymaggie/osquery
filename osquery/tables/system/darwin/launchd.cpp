@@ -1,19 +1,24 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
+/*
+ *  Copyright (c) 2014, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
 
 #include <sstream>
 
-#include <glog/logging.h>
-
 #include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/replace.hpp>
-#include <boost/lexical_cast.hpp>
 
-#include "osquery/core.h"
-#include "osquery/database.h"
-#include "osquery/filesystem.h"
-#include "osquery/status.h"
+#include <osquery/core.h>
+#include <osquery/filesystem.h>
+#include <osquery/logger.h>
+#include <osquery/tables.h>
 
-using osquery::Status;
+namespace fs = boost::filesystem;
 namespace pt = boost::property_tree;
 
 namespace osquery {
@@ -23,6 +28,10 @@ const std::vector<std::string> kLaunchdSearchPaths = {
     "/System/Library/LaunchDaemons",
     "/Library/LaunchDaemons",
     "/System/Library/LaunchAgents",
+    "/Library/LaunchAgents",
+};
+
+const std::vector<std::string> kUserLaunchdSearchPaths = {
     "/Library/LaunchAgents",
 };
 
@@ -38,8 +47,8 @@ const std::map<std::string, std::string> kLaunchdTopLevelStringKeys = {
     {"StartOnMount", "start_on_mount"},
     {"OnDemand", "on_demand"},
     {"Disabled", "disabled"},
-    {"UserName", "user_name"},
-    {"GroupName", "group_name"},
+    {"UserName", "username"},
+    {"GroupName", "groupname"},
     {"RootDirectory", "root_directory"},
     {"WorkingDirectory", "working_directory"},
     {"ProcessType", "process_type"},
@@ -51,90 +60,110 @@ const std::map<std::string, std::string> kLaunchdTopLevelArrayKeys = {
     {"QueueDirectories", "queue_directories"},
 };
 
-std::vector<std::string> getLaunchdFiles() {
-  std::vector<std::string> results;
+const std::string kLaunchdOverridesPath =
+    "/var/db/launchd.db/%/overrides.plist";
 
-  for (const auto& path : kLaunchdSearchPaths) {
-    std::vector<std::string> files;
-    auto s = osquery::listFilesInDirectory(path, files);
-    if (s.ok()) {
-      std::copy(files.begin(), files.end(), std::back_inserter(results));
-    } else {
-      VLOG(1) << "Error listing files in: " << path;
-    }
-  }
-
-  std::vector<std::string> home_dirs;
-  auto s = osquery::listFilesInDirectory("/Users", home_dirs);
-  if (s.ok()) {
-    for (const auto& home_dir : home_dirs) {
-      std::string path = home_dir + "/Library/LaunchAgents";
-      std::vector<std::string> files;
-      auto user_list_s = osquery::listFilesInDirectory(path, files);
-      if (user_list_s.ok()) {
-        std::copy(files.begin(), files.end(), std::back_inserter(results));
-      } else {
-        VLOG(1) << "Error listing " << path << ": " << user_list_s.toString();
-      }
-    }
-  } else {
-    VLOG(1) << "Error listing /Users: " << s.toString();
-  }
-
-  return results;
-}
-
-Row parseLaunchdItem(const std::string& path, const pt::ptree& tree) {
+void genLaunchdItem(const pt::ptree& tree,
+                    const fs::path& path,
+                    QueryData& results) {
   Row r;
-  r["path"] = path;
-  auto bits = osquery::split(path, "/");
-  r["name"] = bits[bits.size() - 1];
-
+  r["path"] = path.string();
+  r["name"] = path.filename().string();
   for (const auto& it : kLaunchdTopLevelStringKeys) {
-    std::string item;
-    try {
-      item = tree.get<std::string>(it.first);
-      if (it.first == "Program") {
-        boost::replace_all(item, " ", "\\ ");
-      }
-    } catch (const pt::ptree_error& e) {
-      VLOG(3) << "Error parsing " << it.first << " from " << path << ": "
-              << e.what();
-    }
-    r[it.second] = item;
+    // For known string-values, the column is the value.
+    r[it.second] = tree.get(it.first, "");
   }
 
   for (const auto& it : kLaunchdTopLevelArrayKeys) {
-    try {
-      pt::ptree subtree = tree.get_child(it.first);
-      std::vector<std::string> array_results;
-      for (const auto& each : subtree) {
-        std::string item = each.second.get<std::string>("");
-        boost::replace_all(item, " ", "\\ ");
-        array_results.push_back(item);
-      }
-      r[it.second] = boost::algorithm::join(array_results, " ");
-    } catch (pt::ptree_error& e) {
-      VLOG(1) << "Error parsing " << it.first << " from " << path << ": "
-              << e.what();
-      r[it.second] = "";
+    // Otherwise walk an array item and join the arguments.
+    if (tree.count(it.first) == 0) {
+      continue;
     }
+
+    auto subtree = tree.get_child(it.first);
+    std::vector<std::string> arguments;
+    for (const auto& argument : subtree) {
+      arguments.push_back(argument.second.get<std::string>(""));
+    }
+    r[it.second] = boost::algorithm::join(arguments, " ");
   }
-  return r;
+
+  results.push_back(std::move(r));
 }
 
-QueryData genLaunchd() {
+QueryData genLaunchd(QueryContext& context) {
   QueryData results;
-  auto launchd_files = getLaunchdFiles();
-  for (const auto& path : launchd_files) {
-    pt::ptree tree;
-    auto s = osquery::parsePlist(path, tree);
-    if (s.ok()) {
-      results.push_back(parseLaunchdItem(path, tree));
-    } else {
-      LOG(WARNING) << "Error parsing " << path << ": " << s.toString();
+
+  std::vector<std::string> launchers;
+  for (const auto& search_path : kLaunchdSearchPaths) {
+    osquery::listFilesInDirectory(search_path, launchers);
+  }
+
+  // List all users on the system, and walk common search paths with homes.
+  auto homes = osquery::getHomeDirectories();
+  for (const auto& home : homes) {
+    for (const auto& path : kUserLaunchdSearchPaths) {
+      osquery::listFilesInDirectory(home / path, launchers);
     }
   }
+
+  // The osquery::parsePlist method will reset/clear a property tree.
+  // Keeping the data structure in a larger scope preserves allocations
+  // between similar-sized trees.
+  pt::ptree tree;
+
+  // For each found launcher (plist in known paths) parse the plist.
+  for (const auto& path : launchers) {
+    if (!context.constraints["path"].matches(path)) {
+      // Optimize by not searching when a path is a constraint.
+      continue;
+    }
+
+    if (!osquery::parsePlist(path, tree).ok()) {
+      TLOG << "Error parsing launch daemon/agent plist: " << path;
+      continue;
+    }
+
+    // Using the parsed plist, pull out each set of interesting keys.
+    genLaunchdItem(tree, path, results);
+  }
+
+  return std::move(results);
+}
+
+void genLaunchdOverride(const fs::path& path, QueryData& results) {
+  Row r;
+  r["path"] = path.string();
+  // The overrides may be restricted to a user, based on the folder.
+  auto group = osquery::split(path.parent_path().filename().string(), ".");
+  r["uid"] = (group.size() == 5) ? BIGINT(group.at(4)) : "0";
+
+  pt::ptree tree;
+  if (!osquery::parsePlist(path, tree).ok()) {
+    return;
+  }
+
+  // Include a row for each label : key since we do not know the set of keys
+  // that may be overridden.
+  for (const auto& daemon : tree) {
+    r["label"] = daemon.first.data();
+    for (const auto& item : daemon.second) {
+      r["key"] = item.first.data();
+      r["value"] = item.second.get_value("");
+      results.push_back(r);
+    }
+  }
+}
+
+QueryData genLaunchdOverrides(QueryContext& context) {
+  QueryData results;
+
+  std::vector<std::string> overrides;
+  osquery::resolveFilePattern(kLaunchdOverridesPath, overrides);
+  for (const auto& group : overrides) {
+    genLaunchdOverride(group, results);
+  }
+
   return results;
 }
 }

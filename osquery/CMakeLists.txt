@@ -1,232 +1,269 @@
-SET(OSQUERY_LIBS
-  readline
-  pthread
-  dl
-  crypto
-  ssl
-)
-
-if(APPLE)
-  list(APPEND OSQUERY_LIBS "boost_thread-mt")
-  list(APPEND OSQUERY_LIBS "boost_system")
-  list(APPEND OSQUERY_LIBS "boost_filesystem")
-  list(APPEND OSQUERY_LIBS "boost_program_options")
-  list(APPEND OSQUERY_LIBS "boost_regex")
-  list(APPEND OSQUERY_LIBS "thrift")
-  list(APPEND OSQUERY_LIBS "rocksdb")
-  list(APPEND OSQUERY_LIBS "gflags")
-  list(APPEND OSQUERY_LIBS "glog")
-else()
-  list(APPEND OSQUERY_LIBS "rt")
-  list(APPEND OSQUERY_LIBS "libgflags.a")
-  list(APPEND OSQUERY_LIBS "libglog.a")
-  list(APPEND OSQUERY_LIBS "librocksdb.a")
-  if(EXISTS "/etc/debian_version")
-    list(APPEND OSQUERY_LIBS "libz.a")
-    list(APPEND OSQUERY_LIBS "libbz2.a")
-    list(APPEND OSQUERY_LIBS "libsnappy.a")
-    list(APPEND OSQUERY_LIBS "libunwind.a")
-    list(APPEND OSQUERY_LIBS "liblzma.a")
-    if(EXISTS "/usr/lib/libprocps.a" OR EXISTS "/usr/lib/x86_64-linux-gnu/libprocps.a")
-      list(APPEND OSQUERY_LIBS "libprocps.a")
-    else()
-      list(APPEND OSQUERY_LIBS "libproc.a")
-    endif()
-  endif()
-  if(EXISTS "/etc/redhat-release")
-    list(APPEND OSQUERY_LIBS "libz.so")
-    list(APPEND OSQUERY_LIBS "libbz2.so")
-    list(APPEND OSQUERY_LIBS "libsnappy.so")
-    list(APPEND OSQUERY_LIBS "libunwind.so")
-    list(APPEND OSQUERY_LIBS "liblzma.so")
-    list(APPEND OSQUERY_LIBS "libproc.so")
-  endif()
-  list(APPEND OSQUERY_LIBS "libthrift.a")
-  list(APPEND OSQUERY_LIBS "libboost_thread.a")
-  list(APPEND OSQUERY_LIBS "libboost_system.a")
-  list(APPEND OSQUERY_LIBS "libboost_filesystem.a")
-  list(APPEND OSQUERY_LIBS "libboost_program_options.a")
-  list(APPEND OSQUERY_LIBS "libboost_regex.a")
-endif()
-
-# Fill this in with objects for libosquery
+# osquery core source files included with the SDK (libosquery).
 set(OSQUERY_SOURCES "")
+set(OSQUERY_LINKS "")
+set(OSQUERY_TESTS "")
+set(OSQUERY_KERNEL_TESTS "")
+
+# osquery benchmarking sources
+set(OSQUERY_BENCHMARKS "")
+set(OSQUERY_KERNEL_BENCHMARKS "")
+
+# osquery core additional sources files not included with SDK (libosquery_additional).
+set(OSQUERY_ADDITIONAL_SOURCES "")
 set(OSQUERY_ADDITIONAL_LINKS "")
+set(OSQUERY_ADDITIONAL_TESTS "")
+set(OSQUERY_TABLES_TESTS "")
 
-MACRO(ADD_OSQUERY_LINK LINK)
-  list(APPEND OSQUERY_ADDITIONAL_LINKS ${LINK})
-  set(OSQUERY_ADDITIONAL_LINKS ${OSQUERY_ADDITIONAL_LINKS} PARENT_SCOPE)
-ENDMACRO(ADD_OSQUERY_LINK)
+# The core set of osquery libraries most discovered with find_package.
+set(OSQUERY_LIBS
+  # This includes librocksdb[_lite] and libsnappy.
+  ${ROCKSDB_LIBRARIES}
+  ${THRIFT_LIBRARY}
+  ${GLOG_LIBRARY}
+  ${GFLAGS_LIBRARY}
+  ${OPENSSL_CRYPTO_LIBRARY}
+  ${OPENSSL_SSL_LIBRARY}
+  ${READLINE_LIBRARIES}
 
-MACRO(SET_OSQUERY_COMPILE TARGET)
-  SET_TARGET_PROPERTIES(${TARGET} PROPERTIES COMPILE_FLAGS ${OS_COMPILE_FLAGS})
-  SET(OPTIONAL_FLAGS ${ARGN})
-  LIST(LENGTH OPTIONAL_FLAGS NUM_OPTIONAL_FLAGS)
-  if(${NUM_OPTIONAL_FLAGS} GREATER 0)
-    SET_TARGET_PROPERTIES(${TARGET} PROPERTIES COMPILE_FLAGS ${OPTIONAL_FLAGS})
-  ENDIF()
-ENDMACRO(SET_OSQUERY_COMPILE)
+  pthread
+  bz2
+  z
+)
 
-MACRO(ADD_OSQUERY_LIBRARY TARGET)
-  ADD_LIBRARY(${TARGET} OBJECT ${ARGN})
-  SET_OSQUERY_COMPILE(${TARGET})
-  list(APPEND OSQUERY_SOURCES $<TARGET_OBJECTS:${TARGET}>)
-  set(OSQUERY_SOURCES ${OSQUERY_SOURCES} PARENT_SCOPE)
-ENDMACRO(ADD_OSQUERY_LIBRARY TARGET)
+# Add all and extra for osquery code.
+add_compile_options(
+  -Wall
+  -Wextra
+  -Wno-unused-parameter
+)
 
-MACRO(ADD_OSQUERY_OBJCXX_LIBRARY TARGET)
-  ADD_LIBRARY(${TARGET} OBJECT ${ARGN})
-  SET_OSQUERY_COMPILE(${TARGET} "-x objective-c++ -fobjc-arc")
-  list(APPEND OSQUERY_SOURCES $<TARGET_OBJECTS:${TARGET}>)
-  set(OSQUERY_SOURCES ${OSQUERY_SOURCES} PARENT_SCOPE)
-ENDMACRO(ADD_OSQUERY_OBJCXX_LIBRARY TARGET)
-
-MACRO(ADD_OSQUERY_TEST TEST_NAME SOURCE)
-  ADD_EXECUTABLE(${TEST_NAME} ${SOURCE})
-  TARGET_LINK_LIBRARIES(${TEST_NAME} ${OSQUERY_ADDITIONAL_LINKS})
-  TARGET_LINK_LIBRARIES(${TEST_NAME} osquery_shared)
-  TARGET_LINK_LIBRARIES(${TEST_NAME} gtest)
-  SET(OPTIONAL_FLAGS ${ARGN})
-  SET_OSQUERY_COMPILE(${TEST_NAME} ${OPTIONAL_FLAGS})
-  ADD_TEST(${TEST_NAME} ${TEST_NAME})
-ENDMACRO(ADD_OSQUERY_TEST)
-
-MACRO(ADD_OSQUERY_EXECUTABLE NAME SOURCE)
-  ADD_OSQUERY_TEST(${NAME} ${SOURCE})
-  TARGET_LINK_LIBRARIES(${NAME} osquery_shared)
-ENDMACRO(ADD_OSQUERY_EXECUTABLE)
-
-MACRO(TARGET_OSQUERY_LINK_WHOLE TARGET OSQUERY_LIB)
-  TARGET_LINK_LIBRARIES(${TARGET} "${OS_WHOLELINK_PRE}")
-  TARGET_LINK_LIBRARIES(${TARGET} ${OSQUERY_LIB})
-  TARGET_LINK_LIBRARIES(${TARGET} "${OS_WHOLELINK_POST}")
-ENDMACRO(TARGET_OSQUERY_LINK_WHOLE)
-
-# Table generation
-
-file(GLOB TABLE_FILES "tables/specs/x/*.table")
-if(APPLE)
-  file(GLOB TABLE_FILES_DARWIN "tables/specs/darwin/*.table")
-  list(APPEND TABLE_FILES ${TABLE_FILES_DARWIN})
+if(NOT FREEBSD)
+  set(OSQUERY_LIBS ${OSQUERY_LIBS} dl)
 else()
-  file(GLOB TABLE_FILES_LINUX "tables/specs/linux/*.table")
-  list(APPEND TABLE_FILES ${TABLE_FILES_LINUX})
+  ADD_OSQUERY_LINK_CORE("icuuc")
 endif()
 
-SET(GENERATED_TABLE "")
-
-foreach(TABLE_FILE ${TABLE_FILES})
-  SET(TABLE_FILE_GEN ${TABLE_FILE})
-  STRING(REPLACE "linux/" "" TABLE_FILE_GEN ${TABLE_FILE_GEN})
-  STRING(REPLACE "darwin/" "" TABLE_FILE_GEN ${TABLE_FILE_GEN})
-  STRING(REPLACE "x/" "" TABLE_FILE_GEN ${TABLE_FILE_GEN})
-  STRING(
-    REPLACE
-    "${CMAKE_SOURCE_DIR}/osquery/tables/specs"
-    "${CMAKE_BINARY_DIR}/generated/tables"
-    TABLE_FILE_GEN
-    ${TABLE_FILE_GEN}
-  )
-  STRING(REPLACE ".table" ".cpp" TABLE_FILE_GEN ${TABLE_FILE_GEN})
-  ADD_CUSTOM_COMMAND(
-    OUTPUT ${TABLE_FILE_GEN}
-    COMMAND python ${CMAKE_SOURCE_DIR}/tools/gentable.py ${TABLE_FILE} ${TABLE_FILE_GEN}
-    DEPENDS ${TABLE_FILE}
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-  )
-  list(APPEND GENERATED_TABLES ${TABLE_FILE_GEN})
+# Add default linking details (the first argument means SDK + core).
+ADD_OSQUERY_LINK_CORE("-rdynamic")
+foreach(DISTRO ${OSQUERY_REQUIRE_RUNTIMES})
+  if(${OSQUERY_BUILD_DISTRO} STREQUAL ${DISTRO})
+    ADD_OSQUERY_LINK_ADDITIONAL("-static-libstdc++")
+  endif()
 endforeach()
-ADD_CUSTOM_TARGET(osquery_generated_tables_depends
-  DEPENDS ${GENERATED_TABLES}
-)
-ADD_LIBRARY(osquery_generated_tables OBJECT
-  ${GENERATED_TABLES}
-)
-ADD_DEPENDENCIES(osquery_generated_tables osquery_generated_tables_depends)
-SET_OSQUERY_COMPILE(osquery_generated_tables)
+
+# The platform-specific SDK + core libraries.
+if(APPLE)
+  ADD_OSQUERY_LINK_CORE("-Wl,-dead_strip")
+  ADD_OSQUERY_LINK_CORE("-mmacosx-version-min=${OSX_VERSION_MIN}")
+  ADD_OSQUERY_LINK_CORE("boost_thread-mt")
+  ADD_OSQUERY_LINK_CORE("lz4")
+else()
+  ADD_OSQUERY_LINK_CORE("-Wl,-zrelro -Wl,-znow")
+  if(NOT ${OSQUERY_BUILD_DISTRO} STREQUAL "rhel6" AND
+     NOT ${OSQUERY_BUILD_DISTRO} STREQUAL "centos6")
+    ADD_OSQUERY_LINK_CORE("-Wl,--gc-sections")
+  endif()
+  ADD_OSQUERY_LINK_CORE("boost_thread")
+  ADD_OSQUERY_LINK_CORE("librt.so")
+endif()
+
+# The remaining boost libraries are discovered with find_library.
+ADD_OSQUERY_LINK_CORE("boost_system")
+ADD_OSQUERY_LINK_CORE("boost_filesystem")
+ADD_OSQUERY_LINK_CORE("boost_regex")
+ADD_OSQUERY_LINK_CORE("yara")
+
+# Remaining additional development libraries.
+ADD_OSQUERY_LINK_ADDITIONAL("cppnetlib-uri")
+ADD_OSQUERY_LINK_ADDITIONAL("cppnetlib-client-connections")
+
+if(DEFINED ENV{SANITIZE})
+  if(DEFINED ENV{SANITIZE_THREAD})
+    ADD_OSQUERY_LINK_CORE(-fsanitize=thread)
+  else()
+    ADD_OSQUERY_LINK_CORE(-fsanitize=address -fsanitize=leak)
+  endif()
+  ADD_OSQUERY_LINK_CORE(-fsanitize-blacklist=${SANITIZE_BLACKLIST})
+endif()
+
+# Construct a set of all object files, starting with third-party and all
+# of the osquery core objects (sources from ADD_CORE_LIBRARY macros).
+set(OSQUERY_OBJECTS $<TARGET_OBJECTS:osquery_sqlite>)
 
 # Add subdirectories
+add_subdirectory(config)
+add_subdirectory(core)
+add_subdirectory(database)
+add_subdirectory(devtools)
+add_subdirectory(dispatcher)
+add_subdirectory(distributed)
+add_subdirectory(events)
+add_subdirectory(extensions)
+add_subdirectory(filesystem)
+add_subdirectory(logger)
+add_subdirectory(registry)
+add_subdirectory(remote)
+add_subdirectory(sql)
 
-ADD_SUBDIRECTORY(config)
-ADD_SUBDIRECTORY(core)
-ADD_SUBDIRECTORY(database)
-ADD_SUBDIRECTORY(devtools)
-ADD_SUBDIRECTORY(events)
-ADD_SUBDIRECTORY(examples)
-ADD_SUBDIRECTORY(filesystem)
-ADD_SUBDIRECTORY(logger)
-ADD_SUBDIRECTORY(dispatcher)
-ADD_SUBDIRECTORY(registry)
-ADD_SUBDIRECTORY(scheduler)
-ADD_SUBDIRECTORY(tables)
+if(NOT ENV{SKIP_TABLES})
+  add_subdirectory(tables)
+endif()
 
-SET(OSQUERY_LIB_OBJECTS
-  # Third-party objects
-  $<TARGET_OBJECTS:osquery_sqlite>
+# Amalgamate the utility tables needed to compile.
+GENERATE_UTILITIES("${CMAKE_SOURCE_DIR}")
+AMALGAMATE("${CMAKE_SOURCE_DIR}" "utils" AMALGAMATION_UTILS)
+ADD_OSQUERY_LIBRARY_CORE(osquery_amalgamation ${AMALGAMATION_UTILS})
 
-  # Generated code
-  $<TARGET_OBJECTS:osquery_generated_tables>
+# Bubble the subdirectory (component) sources and links for this build.
+list(APPEND OSQUERY_OBJECTS ${OSQUERY_SOURCES})
+list(APPEND OSQUERY_LIBS ${OSQUERY_LINKS})
 
-  # Build additional os-dependent libraries (may include tables)
-  ${OSQUERY_SOURCES}
+set(CMAKE_MACOSX_RPATH 0)
+set(CMAKE_SKIP_RPATH TRUE)
+
+# Create the static libosquery (everything but non-utility tables).
+add_library(libosquery STATIC main/lib.cpp ${OSQUERY_OBJECTS})
+target_link_libraries(libosquery ${OSQUERY_LIBS})
+set_target_properties(libosquery PROPERTIES OUTPUT_NAME osquery)
+set_target_properties(libosquery PROPERTIES COMPILE_FLAGS
+  "-DOSQUERY_BUILD_VERSION=${OSQUERY_BUILD_VERSION} ${CXX_COMPILE_FLAGS}")
+
+# A friendly echo printed after the library is built.
+add_custom_target(osquery_library ALL
+  DEPENDS libosquery
+  COMMAND ${CMAKE_COMMAND} -E cmake_echo_color --cyan --bold
+    "-- Built libosquery: ${CMAKE_BINARY_DIR}/libosquery.a"
 )
 
-if(BUILD_SHARED)
-  ADD_LIBRARY(osquery_shared SHARED main/lib.cpp ${OSQUERY_LIB_OBJECTS})
-else()
-  ADD_LIBRARY(osquery_static STATIC ${OSQUERY_LIB_OBJECTS})
-  SET_TARGET_PROPERTIES(osquery_static PROPERTIES OUTPUT_NAME osquery_static)
+# make devel (implies install)
+add_custom_target(devel
+  COMMAND ${CMAKE_COMMAND}
+    -D COMPONENT=devel
+    -P cmake_install.cmake
+    DEPENDS libosquery_basic
+)
+add_dependencies(devel libosquery)
 
-  ADD_LIBRARY(osquery_shared STATIC main/lib.cpp)
-  TARGET_OSQUERY_LINK_WHOLE(osquery_shared osquery_static)
+if(NOT OSQUERY_BUILD_SDK_ONLY)
+  # Generate the osquery additional tables (the non-util).
+  GENERATE_TABLES("${CMAKE_SOURCE_DIR}")
+  AMALGAMATE("${CMAKE_SOURCE_DIR}" "additional" AMALGAMATION)
+  ADD_OSQUERY_LIBRARY_ADDITIONAL(osquery_additional_amalgamation ${AMALGAMATION})
+
+  # Create the static libosquery_additional.
+  add_library(libosquery_additional STATIC ${OSQUERY_ADDITIONAL_SOURCES})
+  target_link_libraries(libosquery_additional ${OSQUERY_ADDITIONAL_LINKS})
+  set_target_properties(libosquery_additional PROPERTIES OUTPUT_NAME osquery_additional)
+
+  add_executable(shell devtools/shell.cpp main/shell.cpp)
+  TARGET_OSQUERY_LINK_WHOLE(shell libosquery)
+  TARGET_OSQUERY_LINK_WHOLE(shell libosquery_additional)
+  SET_OSQUERY_COMPILE(shell "${CXX_COMPILE_FLAGS}")
+  set_target_properties(shell PROPERTIES OUTPUT_NAME osqueryi)
+
+  add_executable(daemon main/daemon.cpp)
+  TARGET_OSQUERY_LINK_WHOLE(daemon libosquery)
+  TARGET_OSQUERY_LINK_WHOLE(daemon libosquery_additional)
+  SET_OSQUERY_COMPILE(daemon "${CXX_COMPILE_FLAGS}")
+  set_target_properties(daemon PROPERTIES OUTPUT_NAME osqueryd)
+
+  # Include the public API includes if make devel.
+  install(TARGETS libosquery ARCHIVE DESTINATION lib COMPONENT devel OPTIONAL)
+  install(DIRECTORY "${CMAKE_SOURCE_DIR}/include/osquery"
+    DESTINATION include
+    COMPONENT devel OPTIONAL
+    PATTERN ".*" EXCLUDE
+  )
+
+  # make install (executables)
+  install(TARGETS shell RUNTIME DESTINATION bin COMPONENT main)
+  install(TARGETS daemon RUNTIME DESTINATION bin COMPONENT main)
+  install(FILES "${CMAKE_SOURCE_DIR}/tools/deployment/osqueryctl"
+    DESTINATION bin COMPONENT main)
+
+  # make install (config files)
+  install(FILES "${CMAKE_SOURCE_DIR}/tools/deployment/osquery.example.conf"
+    DESTINATION "${CMAKE_INSTALL_PREFIX}/share/osquery/" COMPONENT main)
+  install(DIRECTORY DESTINATION "${CMAKE_INSTALL_PREFIX}/var/osquery")
+
+  install(DIRECTORY "${CMAKE_SOURCE_DIR}/packs/"
+    DESTINATION "${CMAKE_INSTALL_PREFIX}/share/osquery/packs" COMPONENT main)
+  if(APPLE)
+    install(FILES "${CMAKE_SOURCE_DIR}/tools/deployment/com.facebook.osqueryd.plist"
+      DESTINATION "${CMAKE_INSTALL_PREFIX}/share/osquery/" COMPONENT main)
+  else()
+    install(PROGRAMS "${CMAKE_SOURCE_DIR}/tools/deployment/osqueryd.initd"
+      DESTINATION "/etc/init.d/" RENAME "osqueryd" COMPONENT main)
+  endif()
 endif()
-TARGET_LINK_LIBRARIES(osquery_shared ${OSQUERY_ADDITIONAL_LINKS})
-TARGET_LINK_LIBRARIES(osquery_shared ${OSQUERY_LIBS})
-SET_TARGET_PROPERTIES(osquery_shared PROPERTIES OUTPUT_NAME osquery)
 
-ADD_EXECUTABLE(shell main/shell.cpp)
-TARGET_LINK_LIBRARIES(shell osquery_shared)
-SET_TARGET_PROPERTIES(shell PROPERTIES OUTPUT_NAME osqueryi)
-SET_TARGET_PROPERTIES(shell PROPERTIES COMPILE_FLAGS ${OS_COMPILE_FLAGS})
-INSTALL(TARGETS shell DESTINATION bin)
+if(NOT DEFINED ENV{SKIP_TESTS})
+  # osquery testing library (testing helper methods/libs).
+  add_library(libosquery_testing STATIC core/test_util.cpp)
+  add_dependencies(libosquery_testing libosquery)
+  SET_OSQUERY_COMPILE(libosquery_testing "${CXX_COMPILE_FLAGS}")
+  set_target_properties(libosquery_testing PROPERTIES OUTPUT_NAME osquery_testing)
 
-ADD_EXECUTABLE(daemon main/daemon.cpp)
-TARGET_LINK_LIBRARIES(daemon osquery_shared)
-SET_TARGET_PROPERTIES(daemon PROPERTIES OUTPUT_NAME osqueryd)
-SET_TARGET_PROPERTIES(daemon PROPERTIES COMPILE_FLAGS ${OS_COMPILE_FLAGS})
-INSTALL(TARGETS daemon DESTINATION bin)
+  # osquery core set of unit tests build with SDK.
+  add_executable(osquery_tests main/tests.cpp ${OSQUERY_TESTS})
+  TARGET_OSQUERY_LINK_WHOLE(osquery_tests libosquery)
+  target_link_libraries(osquery_tests gtest libosquery_testing)
+  SET_OSQUERY_COMPILE(osquery_tests "${CXX_COMPILE_FLAGS} -DGTEST_HAS_TR1_TUPLE=0")
+  add_test(osquery_tests osquery_tests)
 
-# packages
+  # osquery kernel tests.
+  add_executable(osquery_kernel_tests main/tests.cpp ${OSQUERY_KERNEL_TESTS})
+  TARGET_OSQUERY_LINK_WHOLE(osquery_kernel_tests libosquery)
+  TARGET_OSQUERY_LINK_WHOLE(osquery_kernel_tests libosquery_additional)
+  target_link_libraries(osquery_kernel_tests gtest libosquery_testing)
+  SET_OSQUERY_COMPILE(osquery_kernel_tests "${CXX_COMPILE_FLAGS} -DKERNEL_TEST=1 -DGTEST_HAS_TR1_TUPLE=0")
 
-if(NOT APPLE)
-  SET(CPACK_PACKAGE_NAME "osquery")
-  SET(CPACK_PACKAGE_VENDOR "facebook")
+  # osquery benchmarks.
+  if(NOT DEFINED ENV{SKIP_BENCHMARKS})
+    add_executable(osquery_benchmarks main/benchmarks.cpp ${OSQUERY_BENCHMARKS})
+    TARGET_OSQUERY_LINK_WHOLE(osquery_benchmarks libosquery)
+    TARGET_OSQUERY_LINK_WHOLE(osquery_benchmarks libosquery_additional)
+    target_link_libraries(osquery_benchmarks benchmark libosquery_testing)
+    SET_OSQUERY_COMPILE(osquery_benchmarks "${CXX_COMPILE_FLAGS}")
+    set(BENCHMARK_TARGET "$<TARGET_FILE:osquery_benchmarks>")
 
-  SET(CPACK_PACKAGE_VERSION "0.0.1")
-  SET(CPACK_PACKAGE_VERSION_MAJOR 0)
-  SET(CPACK_PACKAGE_VERSION_MINOR 0)
-  SET(CPACK_PACKAGE_VERSION_PATCH 1)
+    # osquery kernel benchmarks.
+    add_executable(osquery_kernel_benchmarks main/benchmarks.cpp ${OSQUERY_KERNEL_BENCHMARKS})
+    TARGET_OSQUERY_LINK_WHOLE(osquery_kernel_benchmarks libosquery)
+    TARGET_OSQUERY_LINK_WHOLE(osquery_kernel_benchmarks libosquery_additional)
+    target_link_libraries(osquery_kernel_benchmarks benchmark libosquery_testing)
+    SET_OSQUERY_COMPILE(osquery_kernel_benchmarks "${CXX_COMPILE_FLAGS} -DKERNEL_TEST=1")
 
-  SET(CPACK_SOURCE_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}")
-  SET(CPACK_PACKAGE_DESCRIPTION_SUMMARY "osquery is an operating system instrumentation toolchain.")
-
-  EXECUTE_PROCESS(COMMAND uname -m OUTPUT_VARIABLE OSQUERY_ARCH)
-  STRING(REPLACE "\n" "" OSQUERY_ARCH ${OSQUERY_ARCH})
-
-  if(EXISTS /etc/apt/sources.list)
-    SET(CPACK_GENERATOR "DEB")
-
-    EXECUTE_PROCESS(COMMAND grep DISTRIB_CODENAME /etc/lsb-release OUTPUT_VARIABLE DISTRO)
-    STRING(REPLACE "DISTRIB_CODENAME=" "" DISTRO ${DISTRO})
-    STRING(REPLACE "\n" "" DISTRO ${DISTRO})
-
-    EXECUTE_PROCESS(COMMAND dpkg --print-architecture OUTPUT_VARIABLE DPKG_ARCH)
-    STRING(REPLACE "\n" "" DPKG_ARCH ${DPKG_ARCH})
-
-    SET(CPACK_SYSTEM_NAME "${DISTRO}.${DPKG_ARCH}")
-    SET(CPACK_DEBIAN_PACKAGE_ARCHITECTURE ${DPKG_ARCH})
-    SET(CPACK_DEBIAN_PACKAGE_MAINTAINER "marpaia@fb.com")
+    # make benchmark
+    add_custom_target(
+      run-benchmark
+      COMMAND bash -c "${BENCHMARK_TARGET} $ENV{BENCHMARK_TO_FILE}"
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+      DEPENDS osquery_benchmarks
+    )
   endif()
 
-  INCLUDE(CPack)
+  if(NOT OSQUERY_BUILD_SDK_ONLY)
+    # osquery core (additional) set of unit tests built outside of SDK.
+    add_executable(osquery_additional_tests main/tests.cpp ${OSQUERY_ADDITIONAL_TESTS})
+    TARGET_OSQUERY_LINK_WHOLE(osquery_additional_tests libosquery)
+    TARGET_OSQUERY_LINK_WHOLE(osquery_additional_tests libosquery_additional)
+    target_link_libraries(osquery_additional_tests gtest libosquery_testing)
+    SET_OSQUERY_COMPILE(osquery_additional_tests "${CXX_COMPILE_FLAGS} -DGTEST_HAS_TR1_TUPLE=0")
+    add_test(osquery_additional_tests osquery_additional_tests)
+
+    # osquery tables set of unit tests (extracted for organization).
+    add_executable(osquery_tables_tests main/tests.cpp ${OSQUERY_TABLES_TESTS})
+    TARGET_OSQUERY_LINK_WHOLE(osquery_tables_tests libosquery)
+    TARGET_OSQUERY_LINK_WHOLE(osquery_tables_tests libosquery_additional)
+    target_link_libraries(osquery_tables_tests gtest libosquery_testing)
+    SET_OSQUERY_COMPILE(osquery_tables_tests "${CXX_COMPILE_FLAGS} -DGTEST_HAS_TR1_TUPLE=0")
+    add_test(osquery_tables_tests osquery_tables_tests)
+  endif()
+
+  # Build the example extension with the SDK.
+  ADD_OSQUERY_EXTENSION(example_extension examples/example_extension.cpp)
+
+  # Build the example extension module with the SDK.
+  ADD_OSQUERY_MODULE(modexample examples/example_module.cpp)
 endif()
