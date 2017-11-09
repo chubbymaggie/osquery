@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
@@ -20,7 +20,12 @@ source $SCRIPT_DIR/lib.sh
 # Define or uncomment the following control variable: RUN_RELEASE_TESTS
 # $ export RUN_RELEASE_TESTS=1
 
+# To request a non-default build target.
+# Define or uncomment the following control variable: RUN_TARGET
+# $ export RUN_TARGET=target
+
 # Run the build function and the tests
-build true
+if [[ -z "$SKIP_TESTS" ]]; then RUN_TESTS=true; else RUN_TESTS=false; fi
+build $RUN_TESTS
 
 exit 0

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -90,7 +90,7 @@ void osquery_cqueue_init(osquery_cqueue_t *queue, void *buffer, size_t size);
  *  function additionally records the system uptime of when it exits so we can
  *  try to guarantee that osquery_cqueue_teardown() does not come along and free
  *  the cqueue locks before lingering event callbacks finish executing.  We do
- *  this by having osquery_cqueue_teardown() fail if it is being called to soon
+ *  this by having osquery_cqueue_teardown() fail if it is being called too soon
  *  after the return from this function.
  *
  *  @param queue The cqueue to destroy.

@@ -4,14 +4,22 @@ schema([
     Column("uid", BIGINT, "The local user that owns the plugin",
       additional=True),
     Column("name", TEXT, "Plugin display name"),
-    Column("identifier", TEXT, "Plugin identifier"),
+    Column("identifier", TEXT, "Plugin identifier", index=True),
     Column("version", TEXT, "Plugin short version"),
     Column("sdk", TEXT, "Build SDK used to compile plugin"),
     Column("description", TEXT, "Plugin description text"),
     Column("development_region", TEXT, "Plugin language-localization"),
     Column("native", INTEGER, "Plugin requires native execution"),
     Column("path", TEXT, "Path to plugin bundle"),
+    Column("disabled", INTEGER, "Is the plugin disabled. 1 = Disabled"),
     ForeignKey(column="uid", table="users")
 ])
 attributes(user_data=True)
 implementation("applications/browser_plugins@genBrowserPlugins")
+examples([
+    "select * from users join browser_plugins using (uid)",
+])
+fuzz_paths([
+    "/Library/Internet Plug-Ins",
+    "/Users",
+])

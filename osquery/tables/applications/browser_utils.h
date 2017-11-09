@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,7 +8,16 @@
  *
  */
 
+#pragma once
+
+#ifdef WIN32
+#pragma warning(push, 3)
+#pragma warning(disable : 4715)
+#endif
 #include <boost/property_tree/json_parser.hpp>
+#ifdef WIN32
+#pragma warning(pop)
+#endif
 
 #include <osquery/filesystem.h>
 #include <osquery/tables.h>

@@ -1,43 +1,21 @@
 #!/usr/bin/env bash
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
 #  LICENSE file in the root directory of this source tree. An additional grant
 #  of patent rights can be found in the PATENTS file in the same directory.
 
-ORACLE_RELEASE=/etc/oracle-release
-SYSTEM_RELEASE=/etc/system-release
-LSB_RELEASE=/etc/lsb-release
-DEBIAN_VERSION=/etc/debian_version
+LIB_SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
+
+# For OS X, define the distro that builds the kernel extension.
+DARWIN_KERNEL_VERSION="10.11"
 
 function platform() {
   local  __out=$1
-  if [[ -f "$ORACLE_RELEASE" ]]; then
-    FAMILY="redhat"
-    eval $__out="oracle"
-  elif [[ -n `grep -o "CentOS" $SYSTEM_RELEASE 2>/dev/null` ]]; then
-    FAMILY="redhat"
-    eval $__out="centos"
-  elif [[ -n `grep -o "Red Hat Enterprise" $SYSTEM_RELEASE 2>/dev/null` ]]; then
-    FAMILY="redhat"
-    eval $__out="rhel"
-  elif [[ -n `grep -o "Amazon Linux" $SYSTEM_RELEASE 2>/dev/null` ]]; then
-    FAMILY="redhat"
-    eval $__out="amazon"
-  elif [[ -f "$LSB_RELEASE" ]] && grep -q 'DISTRIB_ID=Ubuntu' $LSB_RELEASE; then
-    FAMILY="debian"
-    eval $__out="ubuntu"
-  elif [[ -n `grep -o "Fedora" $SYSTEM_RELEASE 2>/dev/null` ]]; then
-    FAMILY="redhat"
-    eval $__out="fedora"
-  elif [[ -f "$DEBIAN_VERSION" ]]; then
-    FAMILY="debian"
-    eval $__out="debian"
-  else
-    eval $__out=`uname -s | tr '[:upper:]' '[:lower:]'`
-  fi
+  FAMILY=$(python "$LIB_SCRIPT_DIR/get_platform.py" --family)
+  eval $__out=$(python "$LIB_SCRIPT_DIR/get_platform.py" --platform)
 }
 
 function _platform() {
@@ -47,27 +25,7 @@ function _platform() {
 
 function distro() {
   local __out=$2
-  if [[ $1 = "oracle" ]]; then
-    eval $__out=`grep -o "release [5-7]" $SYSTEM_RELEASE | sed 's/release /oracle/g'`
-  elif [[ $1 = "centos" ]]; then
-    eval $__out=`grep -o "release [6-7]" $SYSTEM_RELEASE | sed 's/release /centos/g'`
-  elif [[ $1 = "rhel" ]]; then
-    eval $__out=`grep -o "release [6-7]" $SYSTEM_RELEASE | sed 's/release /rhel/g'`
-  elif [[ $1 = "amazon" ]]; then
-    eval $__out=`grep -o "release 20[12][0-9]\.[0-9][0-9]" $SYSTEM_RELEASE | sed 's/release /amazon/g'`
-  elif [[ $1 = "ubuntu" ]]; then
-    eval $__out=`awk -F= '/DISTRIB_CODENAME/ { print $2 }' $LSB_RELEASE`
-  elif [[ $1 = "darwin" ]]; then
-    eval $__out=`sw_vers -productVersion | awk -F '.' '{print $1 "." $2}'`
-  elif [[ $1 = "fedora" ]]; then
-    eval $__out=`cat /etc/system-release | cut -d" " -f3`
-  elif [[ $1 = "debian" ]]; then
-    eval $__out="`lsb_release -cs`"
-  elif [[ $1 = "freebsd" ]]; then
-    eval $__out=`uname -r | awk -F '-' '{print $1}'` 
-  else
-    eval $__out="unknown_version"
-  fi
+  eval $__out=$(python "$LIB_SCRIPT_DIR/get_platform.py" --distro)
 }
 
 function _distro() {
@@ -78,14 +36,14 @@ function _distro() {
 function threads() {
   local __out=$1
   platform OS
-  if [[ $FAMILY = "redhat" ]] || [[ $FAMILY = "debian" ]]; then
+  if [[ $FAMILY = "redhat" ]] || [[ $FAMILY = "debian" ]] || [[ $FAMILY = "suse" ]]; then
     eval $__out=`cat /proc/cpuinfo | grep processor | wc -l`
   elif [[ $OS = "darwin" ]]; then
     eval $__out=`sysctl hw.ncpu | awk '{print $2}'`
   elif [[ $OS = "freebsd" ]]; then
     eval $__out=`sysctl -n kern.smp.cpus`
   else
-    eval $__out=1
+    eval $__out=`nproc`
   fi
 }
 
@@ -113,6 +71,16 @@ function set_cc() {
   export CMAKE_C_COMPILER=$1
 }
 
+function do_sudo() {
+  if [[ "$OSQUERY_NOSUDO" = "True" ]]; then
+    $@
+  else
+    ARGS="$@"
+    log "requesting sudo: $ARGS"
+    sudo $@
+  fi
+}
+
 function contains_element() {
   local e
   for e in "${@:2}"; do [[ "$e" == "$1" ]] && return 0; done
@@ -129,30 +97,72 @@ function in_ec2() {
 
 function build_kernel_cleanup() {
   # Cleanup kernel
-  $MAKE kernel-unload || sudo reboot
+  $MAKE kernel-test-unload || sudo reboot
 }
 
-function initialize() {
-  DISTRO=$1
-
+function checkout_thirdparty() {
   # Reset any work or artifacts from build tests in TP.
   (cd third-party && git reset --hard HEAD)
   git submodule init
   git submodule update
+}
+
+function build_target() {
+  threads THREADS
+
+  # Clean previous build artifacts.
+  $MAKE distclean
+
+  # Build osquery.
+  if [[ -z "$RUN_TARGET" ]]; then
+    $MAKE -j$THREADS
+  else
+    $MAKE $RUN_TARGET -j$THREADS
+  fi
+}
+
+function check_deterministic() {
+  # Expect the project to have been built.
+  ALIAS=$DISTRO
+  if [[ "$OS" = "darwin" ]]; then
+    ALIAS=darwin
+  fi
+  DAEMON=build/$ALIAS/osquery/osqueryd
+  strip $DAEMON
+  RUN1=$(shasum -a 256 $DAEMON)
+
+  # Build again.
+  $MAKE distclean
+  build_target
+
+  strip $DAEMON
+  RUN2=$(shasum -a 256 $DAEMON)
+  echo "Initial build: $RUN1"
+  echo " Second build: $RUN2"
+  if [[ "$RUN1" = "$RUN2" ]]; then
+    exit 0
+  fi
+
+  # The build is not deterministic.
+  exit 1
+}
+
+function initialize() {
+  DISTRO=$1
+  checkout_thirdparty
 
   # Remove any previously-cached variables
   rm build/$DISTRO/CMakeCache.txt >/dev/null 2>&1 || true
 }
 
 function build() {
-  threads THREADS
   platform PLATFORM
   distro $PLATFORM DISTRO
 
   # Build kernel extension/module and tests.
   BUILD_KERNEL=0
-  if [[ "$PLATFORM" = "darwin" ]]; then
-    if [[ "$DISTRO" = "10.10" ]]; then
+  if [[ -z "$SKIP_KERNEL" && "$PLATFORM" = "darwin" ]]; then
+    if [[ "$DISTRO" = "$DARWIN_KERNEL_VERSION" ]]; then
       BUILD_KERNEL=1
     fi
   fi
@@ -164,7 +174,7 @@ function build() {
 
   RUN_TESTS=$1
 
-  cd $SCRIPT_DIR/../
+  cd $LIB_SCRIPT_DIR/../
 
   # Run build host provisions and install library dependencies.
   if [[ ! -z $RUN_BUILD_DEPS ]]; then
@@ -173,11 +183,8 @@ function build() {
     initialize $DISTRO
   fi
 
-  # Clean previous build artifacts.
-  $MAKE clean
-
   # Build osquery.
-  $MAKE -j$THREADS
+  build_target
 
   if [[ $BUILD_KERNEL = 1 ]]; then
     # Build osquery kernel (optional).
@@ -187,7 +194,11 @@ function build() {
     trap build_kernel_cleanup EXIT INT TERM
 
     # Load osquery kernel (optional).
-    $MAKE kernel-load
+    $MAKE kernel-test-load
+  fi
+
+  if [[ ! -z "$RUN_DETERMINISTIC" ]]; then
+    check_deterministic
   fi
 
   if [[ $RUN_TESTS = true ]]; then

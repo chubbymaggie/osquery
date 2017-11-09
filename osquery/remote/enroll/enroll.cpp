@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,14 +9,27 @@
  */
 
 #include <boost/algorithm/string/trim.hpp>
+#include <boost/property_tree/ptree.hpp>
 
 #include <osquery/core.h>
 #include <osquery/database.h>
 #include <osquery/enroll.h>
-#include <osquery/flags.h>
 #include <osquery/filesystem.h>
+#include <osquery/flags.h>
+#include <osquery/sql.h>
+#include <osquery/system.h>
+
+#include "osquery/core/process.h"
+
+namespace pt = boost::property_tree;
 
 namespace osquery {
+
+/// At startup, always do a new enrollment instead of using a cached one
+CLI_FLAG(bool,
+         enroll_always,
+         false,
+         "On startup, send a new enrollment request");
 
 /// Allow users to disable enrollment features.
 CLI_FLAG(bool,
@@ -41,6 +54,19 @@ CLI_FLAG(bool,
          disable_reenrollment,
          false,
          "Disable re-enrollment attempts if related plugins return invalid");
+
+/**
+ * @brief Enroll plugin registry.
+ *
+ * This creates an osquery registry for "enroll" which may implement
+ * EnrollPlugin. Only strings are logged in practice, and EnrollPlugin
+ * provides a helper member for transforming PluginRequests to strings.
+ */
+CREATE_LAZY_REGISTRY(EnrollPlugin, "enroll");
+
+const std::set<std::string> kEnrollHostDetails{
+    "os_version", "osquery_info", "system_info", "platform_info",
+};
 
 Status clearNodeKey() {
   return deleteDatabaseValue(kPersistentSettings, "nodeKey");
@@ -73,16 +99,30 @@ const std::string getEnrollSecret() {
   std::string enrollment_secret;
 
   if (FLAGS_enroll_secret_path != "") {
-    osquery::readFile(FLAGS_enroll_secret_path, enrollment_secret);
+    readFile(FLAGS_enroll_secret_path, enrollment_secret);
     boost::trim(enrollment_secret);
   } else {
-    const char* env_secret = std::getenv(FLAGS_enroll_secret_env.c_str());
-    if (env_secret != nullptr) {
-      enrollment_secret = std::string(env_secret);
+    auto env_secret = getEnvVar(FLAGS_enroll_secret_env);
+    if (env_secret.is_initialized()) {
+      enrollment_secret = *env_secret;
     }
   }
 
   return enrollment_secret;
+}
+
+void EnrollPlugin::genHostDetails(pt::ptree& host_details) {
+  // Select from each table describing host details.
+  for (const auto& table : kEnrollHostDetails) {
+    auto results = SQL::selectAllFrom(table);
+    if (!results.empty()) {
+      pt::ptree details;
+      for (const auto& detail : results[0]) {
+        details.put<std::string>(detail.first, detail.second);
+      }
+      host_details.put_child(table, details);
+    }
+  }
 }
 
 Status EnrollPlugin::call(const PluginRequest& request,

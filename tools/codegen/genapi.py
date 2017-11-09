@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
@@ -34,9 +34,14 @@ CANONICAL_PLATFORMS = {
     "specs": "All Platforms",
     "darwin": "Darwin (Apple OS X)",
     "linux": "Ubuntu, CentOS",
-    "centos": "CentOS",
-    "ubuntu": "Ubuntu",
+    "freebsd": "FreeBSD",
+    "posix": "POSIX-compatible Plaforms",
+    "windows": "Microsoft Windows",
     "utility": "Utility",
+    "yara": "YARA",
+    "lldpd": "LLDPD",
+    "sleuthkit": "The Sleuth Kit",
+    "macwin": "MacOS and Windows"
 }
 
 TEMPLATE_API_DEFINITION = """
@@ -194,6 +199,9 @@ def gen_api(tables_path, profile={}):
             if spec_file == 'blacklist':
                 continue
             platform = os.path.basename(base)
+            # Exclude kernel tables
+            if platform in ['kernel']:
+                continue
             platform_name = CANONICAL_PLATFORMS[platform]
             name = spec_file.split(".table", 1)[0]
             if platform not in categories.keys():

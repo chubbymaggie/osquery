@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,30 +10,33 @@
 
 #pragma once
 
-#include <list>
 #include <map>
 #include <memory>
 #include <vector>
 
-#include <boost/iterator/filter_iterator.hpp>
 #include <boost/property_tree/ptree.hpp>
 
 #include <osquery/core.h>
-#include <osquery/database.h>
+#include <osquery/query.h>
 #include <osquery/registry.h>
 #include <osquery/status.h>
 
 namespace osquery {
 
+class Config;
 class Pack;
 class Schedule;
 class ConfigParserPlugin;
+class ConfigRefreshRunner;
+
+/// The name of the executing query within the single-threaded schedule.
+extern const std::string kExecutingQuery;
 
 /**
  * @brief The programmatic representation of osquery's configuration
  *
  * @code{.cpp}
- *   auto c = Config::getInstance();
+ *   auto c = Config::get();
  *   // use methods in osquery::Config on `c`
  * @endcode
  */
@@ -42,10 +45,9 @@ class Config : private boost::noncopyable {
   Config();
 
  public:
-  /// Get a singleton instance of the Config class
-  static Config& getInstance() {
-    static Config cfg;
-    return cfg;
+  static Config& get() {
+    static Config instance;
+    return instance;
   };
 
   /**
@@ -97,23 +99,32 @@ class Config : private boost::noncopyable {
   /**
    * @brief Calculate the hash of the osquery config
    *
-   * @return The MD5 of the osquery config
+   * @return The SHA1 hash of the osquery config
    */
-  Status getMD5(std::string& hash);
+  Status genHash(std::string& hash);
+
+  /// Retrieve the hash of a named source.
+  std::string getHash(const std::string& source) const;
 
   /**
    * @brief Hash a source's config data
    *
    * @param source is the place where the config content came from
    * @param content is the content of the config data for a given source
+   * @return false if the source did not change, otherwise true
    */
-  void hashSource(const std::string& source, const std::string& content);
+  bool hashSource(const std::string& source, const std::string& content);
 
   /// Whether or not the last loaded config was valid.
-  bool isValid() const { return valid_; }
+  bool isValid() const {
+    return valid_;
+  }
 
   /// Get start time of config.
-  size_t getStartTime() const { return start_time_; }
+  static size_t getStartTime();
+
+  /// Set the start time if the config.
+  static void setStartTime(size_t st);
 
   /**
    * @brief Add a pack to the osquery schedule
@@ -130,11 +141,12 @@ class Config : private boost::noncopyable {
   /**
    * @brief Iterate through all packs
    */
-  void packs(std::function<void(Pack& pack)> predicate);
+  void packs(std::function<void(std::shared_ptr<Pack>& pack)> predicate);
 
   /**
    * @brief Add a file
    *
+   * @param source source of config file
    * @param category is the category which the file exists in
    * @param path is the file path to add
    */
@@ -154,14 +166,15 @@ class Config : private boost::noncopyable {
    *
    * @code{.cpp}
    *   std::map<std::string, ScheduledQuery> queries;
-   *   Config::getInstance().scheduledQueries(
+   *   Config::get().scheduledQueries(
    *      ([&queries](const std::string& name, const ScheduledQuery& query) {
    *        queries[name] = query;
    *      }));
    * @endcode
    */
-  void scheduledQueries(std::function<
-      void(const std::string& name, const ScheduledQuery& query)> predicate);
+  void scheduledQueries(
+      std::function<void(const std::string& name, const ScheduledQuery& query)>
+          predicate);
 
   /**
    * @brief Map a function across the set of configured files
@@ -172,7 +185,7 @@ class Config : private boost::noncopyable {
    *
    * @code{.cpp}
    *   std::map<std::string, std::vector<std::string>> file_map;
-   *   Config::getInstance().files(
+   *   Config::get().files(
    *      ([&file_map](const std::string& category,
    *                   const std::vector<std::string>& files) {
    *        file_map[category] = files;
@@ -192,7 +205,7 @@ class Config : private boost::noncopyable {
    * QueryPerformance struct, if it exists.
    *
    * @code{.cpp}
-   *   Config::getInstance().getPerformanceStats(
+   *   Config::get().getPerformanceStats(
    *     "my_awesome_query",
    *     [](const QueryPerformance& query) {
    *       // use "query" here
@@ -216,6 +229,51 @@ class Config : private boost::noncopyable {
   static const std::shared_ptr<ConfigParserPlugin> getParser(
       const std::string& parser);
 
+ protected:
+  /**
+   * @brief Call the genConfig method of the config retriever plugin.
+   *
+   * This may perform a resource load such as TCP request or filesystem read.
+   * If a non-zero value is passed to --config_refresh, this starts a thread
+   * that periodically calls genConfig to reload config state
+   */
+  Status refresh();
+
+  /// Update the refresh rate.
+  void setRefresh(size_t refresh, size_t mod = 0);
+
+  /// Inspect the refresh rate.
+  size_t getRefresh() const;
+
+  /**
+   * @brief Check if a config plugin is registered and load configs.
+   *
+   * Calls refresh after confirming a config plugin is registered
+   */
+  Status load();
+
+  /// A step method for Config::update.
+  Status updateSource(const std::string& source, const std::string& json);
+
+  /**
+   * @brief Generate pack content from a resource handled by the Plugin.
+   *
+   * Configuration content may set pack values to JSON strings instead of an
+   * embedded dictionary representing the pack content. When a string is
+   * encountered the config assumes this is a 'resource' handled by the Plugin.
+   *
+   * The value, or target, is sent to the ConfigPlugin via a registry request.
+   * The plugin response is assumed, and used, as the pack content.
+   *
+   * @param name A pack name provided and handled by the ConfigPlugin.
+   * @param source The config content source identifier.
+   * @param target A resource (path, URL, etc) handled by the ConfigPlugin.
+   * @return status On success the response will be JSON parsed.
+   */
+  Status genPack(const std::string& name,
+                 const std::string& source,
+                 const std::string& target);
+
   /**
    * @brief Apply each ConfigParser to an input property tree.
    *
@@ -231,20 +289,9 @@ class Config : private boost::noncopyable {
    * @param tree The input configuration tree.
    * @param pack True if the tree was built from pack data, otherwise false.
    */
-  static void applyParsers(const std::string& source,
-                           const boost::property_tree::ptree& tree,
-                           bool pack = false);
-
- protected:
-  /**
-   * @brief Call the genConfig method of the config retriever plugin.
-   *
-   * This may perform a resource load such as TCP request or filesystem read.
-   */
-  Status load();
-
-  /// A step method for Config::update.
-  Status updateSource(const std::string& name, const std::string& json);
+  void applyParsers(const std::string& source,
+                    const boost::property_tree::ptree& tree,
+                    bool pack = false);
 
   /**
    * @brief When config sources are updated the config will 'purge'.
@@ -257,6 +304,11 @@ class Config : private boost::noncopyable {
    */
   void purge();
 
+  /**
+   * @brief Reset the configuration state, reserved for testing only.
+   */
+  void reset();
+
  protected:
   /// Schedule of packs and their queries.
   std::shared_ptr<Schedule> schedule_;
@@ -265,7 +317,7 @@ class Config : private boost::noncopyable {
   std::map<std::string, QueryPerformance> performance_;
 
   /// A set of named categories filled with filesystem globbing paths.
-  using FileCategories = std::map<std::string, std::vector<std::string> >;
+  using FileCategories = std::map<std::string, std::vector<std::string>>;
   std::map<std::string, FileCategories> files_;
 
   /// A set of hashes for each source of the config.
@@ -274,31 +326,45 @@ class Config : private boost::noncopyable {
   /// Check if the config received valid/parsable content from a config plugin.
   bool valid_{false};
 
-  /// Check if the config is updating sources in response to an async update
-  /// or the initialization load step.
+  /**
+   * @brief Check if the configuration has attempted a load.
+   *
+   * Check if the config is updating sources in response to an async update
+   * or the initialization load step.
+   */
   bool loaded_{false};
 
-  /// A UNIX timestamp recorded when the config started.
-  size_t start_time_{0};
+  /// Try if the configuration has started an auto-refresh thread.
+  bool started_thread_{false};
+
+ private:
+  /// Hold a reference to the refresh runner to update the acceleration.
+  std::shared_ptr<ConfigRefreshRunner> refresh_runner_{nullptr};
 
  private:
   friend class Initializer;
 
  private:
-  FRIEND_TEST(ConfigTests, test_plugin_reconfigure);
-  FRIEND_TEST(ConfigTests, test_parse);
-  FRIEND_TEST(ConfigTests, test_remove);
-  FRIEND_TEST(ConfigTests, test_get_scheduled_queries);
-  FRIEND_TEST(ConfigTests, test_get_parser);
-  FRIEND_TEST(ConfigTests, test_add_remove_pack);
-  FRIEND_TEST(ConfigTests, test_update_clear);
-  FRIEND_TEST(ConfigTests, test_noninline_pack);
-
+  friend class ConfigTests;
+  friend class ConfigRefreshRunner;
   friend class FilePathsConfigParserPluginTests;
+  friend class FileEventsTableTests;
+  friend class DecoratorsConfigParserPluginTests;
+  friend class SchedulerTests;
+  FRIEND_TEST(ConfigTests, test_config_refresh);
   FRIEND_TEST(OptionsConfigParserPluginTests, test_get_option);
+  FRIEND_TEST(ViewsConfigParserPluginTests, test_add_view);
+  FRIEND_TEST(ViewsConfigParserPluginTests, test_swap_view);
+  FRIEND_TEST(ViewsConfigParserPluginTests, test_update_view);
+  FRIEND_TEST(OptionsConfigParserPluginTests, test_unknown_option);
+  FRIEND_TEST(EventsConfigParserPluginTests, test_get_event);
   FRIEND_TEST(PacksTests, test_discovery_cache);
+  FRIEND_TEST(PacksTests, test_multi_pack);
   FRIEND_TEST(SchedulerTests, test_monitor);
   FRIEND_TEST(SchedulerTests, test_config_results_purge);
+  FRIEND_TEST(EventsTests, test_event_subscriber_configure);
+  FRIEND_TEST(TLSConfigTests, test_retrieve_config);
+  FRIEND_TEST(TLSConfigTests, test_runner_and_scheduler);
 };
 
 /**
@@ -427,8 +493,8 @@ class ConfigParserPlugin : public Plugin {
   /**
    * @brief Return a list of top-level config keys to receive in updates.
    *
-   * The ::update method will receive a map of these keys with a JSON-parsed
-   * property tree of configuration data.
+   * The ConfigParserPlugin::update method will receive a map of these keys
+   * with a JSON-parsed property tree of configuration data.
    *
    * @return A list of string top-level JSON keys.
    */
@@ -442,36 +508,55 @@ class ConfigParserPlugin : public Plugin {
    * update. Every config parser will receive a map of merged data for each key
    * they requested in keys().
    *
+   * @param source source of the config data
    * @param config A JSON-parsed property tree map.
    * @return Failure if the parser should no longer receive updates.
    */
   virtual Status update(const std::string& source,
                         const ParserConfig& config) = 0;
 
+  /// Allow parsers to perform some setup before the configuration is loaded.
   Status setUp() override;
 
-  const boost::property_tree::ptree& getData() const { return data_; }
+  Status call(const PluginRequest& /*request*/,
+              PluginResponse& /*response*/) override {
+    return Status(0);
+  }
+
+  /**
+   * @brief Accessor for parser-manipulated data.
+   *
+   * Parsers should be used generically, for places within the code base that
+   * request a parser (check for its existence), should only use this
+   * ConfigParserPlugin::getData accessor.
+   *
+   * More complex parsers that require dynamic casting are not recommended.
+   */
+  const boost::property_tree::ptree& getData() const {
+    return data_;
+  }
+
+ protected:
+  /// Allow the config to request parser state resets.
+  virtual void reset();
 
  protected:
   /// Allow the config parser to keep some global state.
   boost::property_tree::ptree data_;
+
+ private:
+  friend class Config;
 };
 
 /**
- * @brief Config plugin registry.
+ * @brief Boost's 1.59 property tree based JSON parser does not accept comments.
  *
- * This creates an osquery registry for "config" which may implement
- * ConfigPlugin. A ConfigPlugin's call API should make use of a genConfig
- * after reading JSON data in the plugin implementation.
- */
-CREATE_REGISTRY(ConfigPlugin, "config");
-
-/**
- * @brief ConfigParser plugin registry.
+ * For semi-compatibility with existing configurations we will attempt to strip
+ * hash and C++ style comments. It is OK for the config update to be latent
+ * as it is a single event. But some configuration plugins may update running
+ * configurations.
  *
- * This creates an osquery registry for "config_parser" which may implement
- * ConfigParserPlugin. A ConfigParserPlugin should not export any call actions
- * but rather have a simple property tree-accessor API through Config.
+ * @param json A mutable input/output string that will contain stripped JSON.
  */
-CREATE_LAZY_REGISTRY(ConfigParserPlugin, "config_parser");
-}
+void stripConfigComments(std::string& json);
+} // namespace osquery

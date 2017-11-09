@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -23,26 +23,34 @@
 namespace osquery {
 
 /// Globbing directory traversal function recursive limit.
-typedef unsigned short GlobLimits;
-
-enum {
+enum GlobLimits : size_t {
   GLOB_FILES = 0x1,
   GLOB_FOLDERS = 0x2,
   GLOB_ALL = GLOB_FILES | GLOB_FOLDERS,
+  GLOB_NO_CANON = 0x4,
 };
 
+inline GlobLimits operator|(GlobLimits a, GlobLimits b) {
+  return static_cast<GlobLimits>(static_cast<size_t>(a) |
+                                 static_cast<size_t>(b));
+}
+
 /// Globbing wildcard character.
-const std::string kSQLGlobWildcard = "%";
+const std::string kSQLGlobWildcard{"%"};
+
 /// Globbing wildcard recursive character (double wildcard).
-const std::string kSQLGlobRecursive = kSQLGlobWildcard + kSQLGlobWildcard;
+const std::string kSQLGlobRecursive{kSQLGlobWildcard + kSQLGlobWildcard};
 
 /**
  * @brief Read a file from disk.
  *
  * @param path the path of the file that you would like to read.
+ * @param size Number of bytes to read from file.
  * @param content a reference to a string which will be populated with the
  * contents of the path indicated by the path parameter.
  * @param dry_run do not actually read the file content.
+ * @param preserve_time Attempt to preserve file mtime and atime.
+ * @param blocking Request a blocking read.
  *
  * @return an instance of Status, indicating success or failure.
  */
@@ -50,30 +58,33 @@ Status readFile(const boost::filesystem::path& path,
                 std::string& content,
                 size_t size = 0,
                 bool dry_run = false,
-                bool preserve_time = false);
+                bool preserve_time = false,
+                bool blocking = false);
 
 /// Read a file and preserve the atime and mtime.
 Status forensicReadFile(const boost::filesystem::path& path,
-                        std::string& content);
+                        std::string& content,
+                        bool blocking = false);
 
 /**
  * @brief Return the status of an attempted file read.
  *
  * @param path the path of the file that you would like to read.
+ * @param blocking Request a blocking read.
  *
  * @return success iff the file would have been read. On success the status
  * message is the complete/absolute path.
  */
-Status readFile(const boost::filesystem::path& path);
+Status readFile(const boost::filesystem::path& path, bool blocking = false);
 
 /// Internal representation for predicate-based chunk reading.
-Status readFile(
-    const boost::filesystem::path& path,
-    size_t size,
-    size_t block_size,
-    bool dry_run,
-    bool preserve_time,
-    std::function<void(std::string& buffer, size_t size)> predicate);
+Status readFile(const boost::filesystem::path& path,
+                size_t size,
+                size_t block_size,
+                bool dry_run,
+                bool preserve_time,
+                std::function<void(std::string& buffer, size_t size)> predicate,
+                bool blocking = false);
 
 /**
  * @brief Write text to disk.
@@ -90,11 +101,25 @@ Status writeTextFile(const boost::filesystem::path& path,
                      int permissions = 0660,
                      bool force_permissions = false);
 
-/// Check if a path is writable.
-Status isWritable(const boost::filesystem::path& path);
+/**
+ * @brief Check if a path is writable.
+ *
+ * @param path The path of the file that you would like to write.
+ * @param effective If you would like to check using effective UID
+ *
+ * @return A status returning if it's writable
+ */
+Status isWritable(const boost::filesystem::path& path, bool effective = false);
 
-/// Check if a path is readable.
-Status isReadable(const boost::filesystem::path& path);
+/**
+ * @brief Check if a path is readable.
+ *
+ * @param path The path of the file that you would like to read.
+ * @param effective If you would like to check using effective UID
+ *
+ * @return A status returning if it's readable
+ */
+Status isReadable(const boost::filesystem::path& path, bool effective = false);
 
 /**
  * @brief A helper to check if a path exists on disk or not.
@@ -186,11 +211,17 @@ Status resolveFilePattern(const boost::filesystem::path& pattern,
  * For example: /tmp/% becomes /private/tmp/% on OS X systems. And /tmp/%.
  *
  * @param pattern the input and output filesystem glob pattern.
+ * @param limits osquery::GlobLimits to apply (currently only recognizes
+ * osquery::GLOB_NO_CANON)
  */
-void replaceGlobWildcards(std::string& pattern);
+void replaceGlobWildcards(std::string& pattern, GlobLimits limits = GLOB_ALL);
 
 /// Attempt to remove a directory path.
-Status remove(const boost::filesystem::path& path);
+Status removePath(const boost::filesystem::path& path);
+
+/// Move a file or directory to another path.
+Status movePath(const boost::filesystem::path& from,
+                const boost::filesystem::path& to);
 
 /**
  * @brief Check if an input path is a directory.
@@ -221,8 +252,8 @@ std::set<boost::filesystem::path> getHomeDirectories();
  *
  * @return true if the file is 'safe' else false.
  */
-bool safePermissions(const std::string& dir,
-                     const std::string& path,
+bool safePermissions(const boost::filesystem::path& dir,
+                     const boost::filesystem::path& path,
                      bool executable = false);
 
 /**
@@ -250,7 +281,7 @@ Status parseJSON(const boost::filesystem::path& path,
 /**
  * @brief Parse JSON content into a property tree.
  *
- * @param path JSON string data.
+ * @param content JSON string data.
  * @param tree output property tree.
  *
  * @return an instance of Status, indicating success or failure if malformed.
@@ -338,6 +369,35 @@ Status procReadDescriptor(const std::string& process,
  * @return status The status of the read.
  */
 Status readRawMem(size_t base, size_t length, void** buffer);
-
 #endif
-}
+
+/*
+ * @brief A function to archive files specified into a single file
+ *
+ * @param path The paths that you want bundled into the archive
+ * @param out The path where the resulting tar will be written to
+ * Given a set of paths we bundle these into a tar archive.
+ */
+Status archive(const std::set<boost::filesystem::path>& path,
+               const boost::filesystem::path& out);
+
+/*
+ * @brief Given a path, compress it with zstd and save to out.
+ *
+ * @param in The file to compress
+ * @param out Where to write the compressed file to
+ * @return A status containing the success or failure of the operation
+ */
+Status compress(const boost::filesystem::path& in,
+                const boost::filesystem::path& out);
+
+/*
+ * @brief Given a path, decompress it with zstd and save to out.
+ *
+ * @param in The file to decompress
+ * @param out Where to write the decompressed file to
+ * @return A status containing the success or failure of the operation
+ */
+Status decompress(const boost::filesystem::path& in,
+                  const boost::filesystem::path& out);
+} // namespace osquery

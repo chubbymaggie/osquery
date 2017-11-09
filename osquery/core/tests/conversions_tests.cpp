@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,9 +13,17 @@
 
 #include <gtest/gtest.h>
 
+#include <osquery/core.h>
+#include <osquery/flags.h>
+#include <osquery/system.h>
+
 #include "osquery/core/conversions.h"
 
+#include "osquery/tests/test_util.h"
+
 namespace osquery {
+
+DECLARE_bool(utc);
 
 class ConversionsTests : public testing::Test {};
 
@@ -53,7 +61,7 @@ TEST_F(ConversionsTests, test_ascii_false) {
 }
 
 TEST_F(ConversionsTests, test_unicode_unescape) {
-  std::vector<std::pair<std::string, std::string> > conversions = {
+  std::vector<std::pair<std::string, std::string>> conversions = {
       std::make_pair("\\u0025hi", "%hi"),
       std::make_pair("hi\\u0025", "hi%"),
       std::make_pair("\\uFFFFhi", "\\uFFFFhi"),
@@ -64,5 +72,82 @@ TEST_F(ConversionsTests, test_unicode_unescape) {
   for (const auto& test : conversions) {
     EXPECT_EQ(unescapeUnicode(test.first), test.second);
   }
+}
+
+TEST_F(ConversionsTests, test_split) {
+  for (const auto& i : generateSplitStringTestData()) {
+    EXPECT_EQ(split(i.test_string), i.test_vector);
+  }
+}
+
+TEST_F(ConversionsTests, test_join) {
+  std::vector<std::string> content = {
+      "one", "two", "three",
+  };
+  EXPECT_EQ(join(content, ", "), "one, two, three");
+}
+
+TEST_F(ConversionsTests, test_split_occurences) {
+  std::string content = "T: 'S:S'";
+  std::vector<std::string> expected = {
+      "T", "'S:S'",
+  };
+  EXPECT_EQ(split(content, ":", 1), expected);
+}
+
+TEST_F(ConversionsTests, test_buffer_sha1) {
+  std::string test = "test\n";
+  EXPECT_EQ("4e1243bd22c66e76c2ba9eddc1f91394e57f9f83",
+            getBufferSHA1(test.c_str(), test.size()));
+}
+
+TEST_F(ConversionsTests, test_json_array) {
+  auto doc = JSON::newArray();
+
+  {
+    auto line = doc.getObject();
+    size_t value = 10_sz;
+    doc.add("key", value, line);
+    doc.push(line);
+  }
+
+  std::string result;
+  EXPECT_TRUE(doc.toString(result));
+
+  std::string expected = "[{\"key\":10}]";
+  EXPECT_EQ(expected, result);
+}
+
+TEST_F(ConversionsTests, test_json_object) {
+  auto doc = JSON::newObject();
+
+  {
+    size_t value = 10_sz;
+    doc.add("key", value);
+  }
+
+  std::string result;
+  EXPECT_TRUE(doc.toString(result));
+
+  std::string expected = "{\"key\":10}";
+  EXPECT_EQ(expected, result);
+}
+
+TEST_F(ConversionsTests, test_json_strings) {
+  auto doc = JSON::newObject();
+
+  {
+    std::string value("value");
+    doc.addCopy("key", value);
+  }
+
+  std::string value2("value2");
+  doc.addRef("key2", value2);
+
+  std::string result;
+  EXPECT_TRUE(doc.toString(result));
+
+  std::string expected = "{\"key\":\"value\",\"key2\":\"value2\"}";
+  EXPECT_EQ(expected, result);
 }
 }

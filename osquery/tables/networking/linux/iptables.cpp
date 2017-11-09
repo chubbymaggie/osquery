@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,6 +12,7 @@
 
 #include <arpa/inet.h>
 #include <libiptc/libiptc.h>
+#include <netinet/in.h>
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
@@ -20,15 +21,17 @@
 #include <osquery/logger.h>
 #include <osquery/tables.h>
 
+#include "osquery/core/conversions.h"
 #include "osquery/tables/networking/utils.h"
 
 namespace osquery {
 namespace tables {
 
-const std::string kLinuxIpTablesNames = "/proc/net/ip_tables_names";
-const char MAP[] = {'0','1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
-const int HIGH_BITS = 4;
-const int LOW_BITS = 15;
+static const std::string kLinuxIpTablesNames = "/proc/net/ip_tables_names";
+static const std::string kHexMap = "0123456789ABCDEF";
+
+static const int kMaskHighBits = 4;
+static const int kMaskLowBits = 15;
 
 void parseIpEntry(const ipt_ip *ip, Row &r) {
   r["protocol"] = INTEGER(ip->proto);
@@ -41,7 +44,7 @@ void parseIpEntry(const ipt_ip *ip, Row &r) {
   if (strlen(ip->outiface)) {
     r["outiface"] = TEXT(ip->outiface);
   } else {
-   r["outiface"] = "all";
+    r["outiface"] = "all";
   }
 
   r["src_ip"] = ipAsString(&ip->src);
@@ -52,8 +55,8 @@ void parseIpEntry(const ipt_ip *ip, Row &r) {
   char aux_char[2] = {0};
   std::string iniface_mask;
   for (int i = 0; i < IFNAMSIZ && ip->iniface_mask[i] != 0x00; i++) {
-    aux_char[0] = MAP[(int) ip->iniface_mask[i] >> HIGH_BITS];
-    aux_char[1] = MAP[(int) ip->iniface_mask[i] & LOW_BITS];
+    aux_char[0] = kHexMap[(int)ip->iniface_mask[i] >> kMaskHighBits];
+    aux_char[1] = kHexMap[(int)ip->iniface_mask[i] & kMaskLowBits];
     iniface_mask += aux_char[0];
     iniface_mask += aux_char[1];
   }
@@ -61,12 +64,37 @@ void parseIpEntry(const ipt_ip *ip, Row &r) {
   r["iniface_mask"] = TEXT(iniface_mask);
   std::string outiface_mask = "";
   for (int i = 0; i < IFNAMSIZ && ip->outiface_mask[i] != 0x00; i++) {
-    aux_char[0] = MAP[(int) ip->outiface_mask[i] >> HIGH_BITS];
-    aux_char[1] = MAP[(int) ip->outiface_mask[i] & LOW_BITS];
+    aux_char[0] = kHexMap[(int)ip->outiface_mask[i] >> kMaskHighBits];
+    aux_char[1] = kHexMap[(int)ip->outiface_mask[i] & kMaskLowBits];
     outiface_mask += aux_char[0];
     outiface_mask += aux_char[1];
   }
   r["outiface_mask"] = TEXT(outiface_mask);
+}
+
+void parseEntryMatch(const struct ipt_entry* en, Row& r) {
+  // Get rule port details from the xt_entry_match object
+
+  // m will never be NULL, elems is an array
+  auto m = (struct xt_entry_match*)en->elems;
+
+  if (en->ip.proto == IPPROTO_TCP) {
+    // m_data will never be NULL if ip.proto is set to TCP/UDP
+    auto m_data = (struct ipt_tcp*)m->data;
+    r["src_port"] =
+        std::to_string(m_data->spts[0]) + ':' + std::to_string(m_data->spts[1]);
+    r["dst_port"] =
+        std::to_string(m_data->dpts[0]) + ':' + std::to_string(m_data->dpts[1]);
+  } else if (en->ip.proto == IPPROTO_UDP) {
+    auto m_data = (struct ipt_udp*)m->data;
+    r["src_port"] =
+        std::to_string(m_data->spts[0]) + ':' + std::to_string(m_data->spts[1]);
+    r["dst_port"] =
+        std::to_string(m_data->dpts[0]) + ':' + std::to_string(m_data->dpts[1]);
+  } else {
+    r["src_port"] = "";
+    r["dst_port"] = "";
+  }
 }
 
 void genIPTablesRules(const std::string &filter, QueryData &results) {
@@ -97,11 +125,12 @@ void genIPTablesRules(const std::string &filter, QueryData &results) {
       r["bytes"] = "0";
     }
 
-    const struct ipt_entry * prev_rule = nullptr;
+    const struct ipt_entry *prev_rule = nullptr;
     // Iterating through all the rules per chain
-    for (const struct ipt_entry * chain_rule = iptc_first_rule(chain, handle); chain_rule;
+    for (const struct ipt_entry *chain_rule = iptc_first_rule(chain, handle);
+         chain_rule;
          chain_rule = iptc_next_rule(prev_rule, handle)) {
-      prev_rule = chain_rule; 
+      prev_rule = chain_rule;
 
       auto target = iptc_get_target(chain_rule, handle);
       if (target != nullptr) {
@@ -112,8 +141,12 @@ void genIPTablesRules(const std::string &filter, QueryData &results) {
 
       if (chain_rule->target_offset) {
         r["match"] = "yes";
+        // fill protocol port details
+        parseEntryMatch(chain_rule, r);
       } else {
         r["match"] = "no";
+        r["src_port"] = "";
+        r["dst_port"] = "";
       }
 
       const struct ipt_ip *ip = &chain_rule->ip;
@@ -122,12 +155,12 @@ void genIPTablesRules(const std::string &filter, QueryData &results) {
       results.push_back(r);
     } // Rule iteration
     results.push_back(r);
-  } // Chain iteration 
+  } // Chain iteration
 
   iptc_free(handle);
 }
 
-QueryData genIptables(QueryContext& context) {
+QueryData genIptables(QueryContext &context) {
   QueryData results;
 
   // Read in table names

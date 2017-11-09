@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,13 +10,24 @@
 
 #pragma once
 
+#include <atomic>
+#include <iomanip>
+
 #include <osquery/events.h>
 #include <osquery/status.h>
 
 #include <CoreServices/CoreServices.h>
-#include <IOKit/IOKitlib.h>
+#include <IOKit/IOKitLib.h>
+
+#include "osquery/core/conversions.h"
 
 namespace osquery {
+
+extern const std::string kIOUSBDeviceClassName_;
+extern const std::string kIOPCIDeviceClassName_;
+extern const std::string kIOPlatformExpertDeviceClassName_;
+extern const std::string kIOACPIPlatformDeviceClassName_;
+extern const std::string kIOPlatformDeviceClassname_;
 
 struct IOKitSubscriptionContext : public SubscriptionContext {
   std::string model_id;
@@ -44,6 +55,31 @@ struct IOKitEventContext : public EventContext {
   std::string serial;
 };
 
+struct IOKitPCIProperties {
+  std::string vendor_id;
+  std::string model_id;
+  std::string pci_class;
+  std::string driver;
+
+  /// Populate IOKit PCI device properties from the "compatible" property.
+  explicit IOKitPCIProperties(const std::string& compatible);
+};
+
+std::string getIOKitProperty(const CFMutableDictionaryRef& details,
+                             const std::string& key);
+long long int getNumIOKitProperty(const CFMutableDictionaryRef& details,
+                                  const std::string& key);
+
+inline void idToHex(std::string& id) {
+  long base = 0;
+  // = AS_LITERAL(int, id);
+  if (safeStrtol(id, 10, base)) {
+    std::stringstream hex_id;
+    hex_id << std::hex << std::setw(4) << std::setfill('0') << (base & 0xFFFF);
+    id = hex_id.str();
+  }
+}
+
 using IOKitEventContextRef = std::shared_ptr<IOKitEventContext>;
 using IOKitSubscriptionContextRef = std::shared_ptr<IOKitSubscriptionContext>;
 
@@ -57,8 +93,6 @@ class IOKitEventPublisher
   void tearDown() override;
 
   Status run() override;
-
-  void end() override { stop(); }
 
   bool shouldFire(const IOKitSubscriptionContextRef& sc,
                   const IOKitEventContextRef& ec) const override;
@@ -75,23 +109,23 @@ class IOKitEventPublisher
 
  private:
   void restart();
-  void stop();
+  void stop() override;
 
  private:
-  // The publisher state machine will start, restart, and stop the run loop.
+  /// The publisher state machine will start, restart, and stop the run loop.
   CFRunLoopRef run_loop_{nullptr};
 
-  // Notification port, should close.
+  /// Notification port, should close.
   IONotificationPortRef port_{nullptr};
 
-  // Device attach iterator.
+  /// Device attach iterator.
   io_iterator_t iterator_;
 
-  // Device detach notification.
-  std::vector<std::shared_ptr<struct DeviceTracker> > devices_;
+  /// Device detach notification.
+  std::vector<std::shared_ptr<struct DeviceTracker>> devices_;
 
-  // Device notification tracking lock.
-  std::mutex notification_mutex_;
+  /// Device notification and container access protection mutex.
+  mutable Mutex mutex_;
 
   /**
    * @brief Should events be emitted by the callback.
@@ -100,6 +134,6 @@ class IOKitEventPublisher
    * consumed by an iterator walk. Do not emit events for this initial seed.
    * The publisher started boolean is set after a successful restart.
    */
-  bool publisher_started_{false};
+  std::atomic<bool> publisher_started_{false};
 };
 }

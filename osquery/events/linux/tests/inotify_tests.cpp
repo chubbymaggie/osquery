@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,7 +12,6 @@
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
-#include <boost/thread.hpp>
 
 #include <gtest/gtest.h>
 
@@ -21,7 +20,7 @@
 #include <osquery/tables.h>
 
 #include "osquery/events/linux/inotify.h"
-#include "osquery/core/test_util.h"
+#include "osquery/tests/test_util.h"
 
 namespace fs = boost::filesystem;
 
@@ -32,8 +31,17 @@ const int kMaxEventLatency = 3000;
 class INotifyTests : public testing::Test {
  protected:
   void SetUp() override {
-    real_test_path = kTestWorkingDirectory + "inotify-trigger";
-    real_test_dir = kTestWorkingDirectory + "inotify-triggers";
+    // INotify will use data from the config and config parsers.
+    Registry::get().registry("config_parser")->setUp();
+
+    // Create a basic path trigger, this is a file path.
+    real_test_path = kTestWorkingDirectory + "inotify-trigger" +
+                     std::to_string(rand() % 10000 + 10000);
+    // Create a similar directory for embedded paths and directories.
+    real_test_dir = kTestWorkingDirectory + "inotify-triggers" +
+                    std::to_string(rand() % 10000 + 10000);
+
+    // Create the embedded paths.
     real_test_dir_path = real_test_dir + "/1";
     real_test_sub_dir = real_test_dir + "/2";
     real_test_sub_dir_path = real_test_sub_dir + "/1";
@@ -41,16 +49,15 @@ class INotifyTests : public testing::Test {
 
   void TearDown() override {
     // End the event loops, and join on the threads.
-    fs::remove_all(real_test_path);
-    fs::remove_all(real_test_dir);
+    removePath(real_test_dir);
   }
 
   void StartEventLoop() {
-    event_pub_ = std::make_shared<INotifyEventPublisher>();
+    event_pub_ = std::make_shared<INotifyEventPublisher>(true);
     auto status = EventFactory::registerEventPublisher(event_pub_);
     FILE* fd = fopen(real_test_path.c_str(), "w");
     fclose(fd);
-    temp_thread_ = boost::thread(EventFactory::run, "inotify");
+    temp_thread_ = std::thread(EventFactory::run, "inotify");
   }
 
   void StopEventLoop() {
@@ -93,33 +100,51 @@ class INotifyTests : public testing::Test {
     fclose(fd);
   }
 
+  void addMonitor(const std::string& path,
+                  uint32_t mask,
+                  bool recursive,
+                  bool add_watch) {
+    auto sc = event_pub_->createSubscriptionContext();
+    event_pub_->addMonitor(path, sc, mask, recursive, add_watch);
+  }
+
   void RemoveAll(std::shared_ptr<INotifyEventPublisher>& pub) {
     pub->subscriptions_.clear();
     // Reset monitors.
-    std::vector<std::string> monitors;
-    for (const auto& path : pub->path_descriptors_) {
-      monitors.push_back(path.first);
+    std::vector<int> wds;
+    for (const auto& path : pub->descriptor_inosubctx_) {
+      wds.push_back(path.first);
     }
-    for (const auto& path : monitors) {
-      pub->removeMonitor(path, true);
+    for (const auto& wd : wds) {
+      pub->removeMonitor(wd, true);
     }
   }
 
  protected:
-  // Internal state managers.
+  /// Internal state managers: publisher reference.
   std::shared_ptr<INotifyEventPublisher> event_pub_{nullptr};
-  boost::thread temp_thread_;
 
-  // Transient paths.
+  /// Internal state managers: event publisher thread.
+  std::thread temp_thread_;
+
+  /// Transient paths ./inotify-trigger.
   std::string real_test_path;
+
+  /// Transient paths ./inotify-triggers/.
   std::string real_test_dir;
+
+  /// Transient paths ./inotify-triggers/1.
   std::string real_test_dir_path;
+
+  /// Transient paths ./inotify-triggers/2/.
   std::string real_test_sub_dir;
+
+  /// Transient paths ./inotify-triggers/2/1.
   std::string real_test_sub_dir_path;
 };
 
 TEST_F(INotifyTests, test_register_event_pub) {
-  auto pub = std::make_shared<INotifyEventPublisher>();
+  auto pub = std::make_shared<INotifyEventPublisher>(true);
   auto status = EventFactory::registerEventPublisher(pub);
   EXPECT_TRUE(status.ok());
 
@@ -132,7 +157,7 @@ TEST_F(INotifyTests, test_register_event_pub) {
 
 TEST_F(INotifyTests, test_inotify_init) {
   // Handle should not be initialized during ctor.
-  auto event_pub = std::make_shared<INotifyEventPublisher>();
+  auto event_pub = std::make_shared<INotifyEventPublisher>(true);
   EXPECT_FALSE(event_pub->isHandleOpen());
 
   // Registering the event type initializes inotify.
@@ -146,7 +171,7 @@ TEST_F(INotifyTests, test_inotify_init) {
 }
 
 TEST_F(INotifyTests, test_inotify_add_subscription_missing_path) {
-  auto pub = std::make_shared<INotifyEventPublisher>();
+  auto pub = std::make_shared<INotifyEventPublisher>(true);
   EventFactory::registerEventPublisher(pub);
 
   // This subscription path is fake, and will succeed.
@@ -160,7 +185,7 @@ TEST_F(INotifyTests, test_inotify_add_subscription_missing_path) {
 }
 
 TEST_F(INotifyTests, test_inotify_add_subscription_success) {
-  auto pub = std::make_shared<INotifyEventPublisher>();
+  auto pub = std::make_shared<INotifyEventPublisher>(true);
   EventFactory::registerEventPublisher(pub);
 
   // This subscription path *should* be real.
@@ -175,47 +200,74 @@ TEST_F(INotifyTests, test_inotify_add_subscription_success) {
 }
 
 TEST_F(INotifyTests, test_inotify_match_subscription) {
-  auto pub = std::make_shared<INotifyEventPublisher>();
-  pub->addMonitor("/etc", IN_ALL_EVENTS, false, false);
-  EXPECT_EQ(pub->path_descriptors_.count("/etc"), 1U);
+  event_pub_ = std::make_shared<INotifyEventPublisher>(true);
+  addMonitor("/etc", IN_ALL_EVENTS, false, false);
+  EXPECT_EQ(event_pub_->path_descriptors_.count("/etc"), 1U);
   // This will fail because there is no trailing "/" at the end.
   // The configure component should take care of these paths.
-  EXPECT_FALSE(pub->isPathMonitored("/etc/passwd"));
-  pub->path_descriptors_.clear();
+  EXPECT_FALSE(event_pub_->isPathMonitored("/etc/passwd"));
+  event_pub_->path_descriptors_.clear();
 
   // Calling addMonitor the correct way.
-  pub->addMonitor("/etc/", IN_ALL_EVENTS, false, false);
-  EXPECT_TRUE(pub->isPathMonitored("/etc/passwd"));
-  pub->path_descriptors_.clear();
+  addMonitor("/etc/", IN_ALL_EVENTS, false, false);
+  EXPECT_TRUE(event_pub_->isPathMonitored("/etc/passwd"));
+  event_pub_->path_descriptors_.clear();
 
   // Test the matching capability.
   {
-    auto sc = pub->createSubscriptionContext();
+    auto sc = event_pub_->createSubscriptionContext();
     sc->path = "/etc";
-    pub->monitorSubscription(sc, false);
+    event_pub_->monitorSubscription(sc, false);
     EXPECT_EQ(sc->path, "/etc/");
-    EXPECT_TRUE(pub->isPathMonitored("/etc/"));
-    EXPECT_TRUE(pub->isPathMonitored("/etc/passwd"));
+    EXPECT_TRUE(event_pub_->isPathMonitored("/etc/"));
+    EXPECT_TRUE(event_pub_->isPathMonitored("/etc/passwd"));
   }
 
   std::vector<std::string> valid_dirs = {"/etc", "/etc/", "/etc/*"};
   for (const auto& dir : valid_dirs) {
-    pub->path_descriptors_.clear();
-    auto sc = pub->createSubscriptionContext();
+    event_pub_->path_descriptors_.clear();
+    auto sc = event_pub_->createSubscriptionContext();
     sc->path = dir;
-    pub->monitorSubscription(sc, false);
-    auto ec = pub->createEventContext();
+    event_pub_->monitorSubscription(sc, false);
+    auto ec = event_pub_->createEventContext();
+    ec->isub_ctx = sc;
     ec->path = "/etc/";
-    EXPECT_TRUE(pub->shouldFire(sc, ec));
+    EXPECT_TRUE(event_pub_->shouldFire(sc, ec));
     ec->path = "/etc/passwd";
-    EXPECT_TRUE(pub->shouldFire(sc, ec));
+    EXPECT_TRUE(event_pub_->shouldFire(sc, ec));
+  }
+
+  std::vector<std::string> exclude_paths = {
+      "/etc/ssh/%%", "/etc/", "/etc/ssl/openssl.cnf", "/"};
+  for (const auto& path : exclude_paths) {
+    event_pub_->exclude_paths_.insert(path);
+  }
+
+  {
+    event_pub_->path_descriptors_.clear();
+    auto sc = event_pub_->createSubscriptionContext();
+    sc->path = "/etc/%%";
+    auto ec = event_pub_->createEventContext();
+    ec->isub_ctx = sc;
+    ec->path = "/etc/ssh/ssh_config";
+    EXPECT_FALSE(event_pub_->shouldFire(sc, ec));
+    ec->path = "/etc/passwd";
+    EXPECT_FALSE(event_pub_->shouldFire(sc, ec));
+    ec->path = "/etc/group";
+    EXPECT_FALSE(event_pub_->shouldFire(sc, ec));
+    ec->path = "/etc/ssl/openssl.cnf";
+    EXPECT_FALSE(event_pub_->shouldFire(sc, ec));
+    ec->path = "/etc/ssl/certs/";
+    EXPECT_TRUE(event_pub_->shouldFire(sc, ec));
   }
 }
 
 class TestINotifyEventSubscriber
     : public EventSubscriber<INotifyEventPublisher> {
  public:
-  TestINotifyEventSubscriber() { setName("TestINotifyEventSubscriber"); }
+  TestINotifyEventSubscriber() {
+    setName("TestINotifyEventSubscriber");
+  }
 
   Status init() override {
     callback_count_ = 0;
@@ -234,8 +286,10 @@ class TestINotifyEventSubscriber
     // r["path"] = ec->path;
 
     // Normally would call Add here.
+    callback_count_++;
+
+    WriteLock lock(actions_lock_);
     actions_.push_back(ec->action);
-    callback_count_ += 1;
     return Status(0, "OK");
   }
 
@@ -258,13 +312,21 @@ class TestINotifyEventSubscriber
     }
   }
 
-  std::vector<std::string> actions() { return actions_; }
+  std::vector<std::string> actions() {
+    WriteLock lock(actions_lock_);
+    return actions_;
+  }
 
-  int count() { return callback_count_; }
+  int count() {
+    return callback_count_;
+  }
 
  public:
-  int callback_count_{0};
+  std::atomic<int> callback_count_{0};
   std::vector<std::string> actions_;
+
+ private:
+  Mutex actions_lock_;
 
  private:
   FRIEND_TEST(INotifyTests, test_inotify_fire_event);
@@ -272,11 +334,12 @@ class TestINotifyEventSubscriber
   FRIEND_TEST(INotifyTests, test_inotify_optimization);
   FRIEND_TEST(INotifyTests, test_inotify_directory_watch);
   FRIEND_TEST(INotifyTests, test_inotify_recursion);
+  FRIEND_TEST(INotifyTests, test_inotify_embedded_wildcards);
 };
 
 TEST_F(INotifyTests, test_inotify_run) {
   // Assume event type is registered.
-  event_pub_ = std::make_shared<INotifyEventPublisher>();
+  event_pub_ = std::make_shared<INotifyEventPublisher>(true);
   auto status = EventFactory::registerEventPublisher(event_pub_);
   EXPECT_TRUE(status.ok());
 
@@ -287,7 +350,7 @@ TEST_F(INotifyTests, test_inotify_run) {
   auto sub = std::make_shared<TestINotifyEventSubscriber>();
   EventFactory::registerEventSubscriber(sub);
 
-  // Create a subscriptioning context
+  // Create a subscription context
   auto mc = std::make_shared<INotifySubscriptionContext>();
   mc->path = real_test_path;
   mc->mask = IN_ALL_EVENTS;
@@ -297,7 +360,7 @@ TEST_F(INotifyTests, test_inotify_run) {
   event_pub_->configure();
 
   // Create an event loop thread (similar to main)
-  boost::thread temp_thread(EventFactory::run, "inotify");
+  std::thread temp_thread(EventFactory::run, "inotify");
   EXPECT_TRUE(event_pub_->numEvents() == 0);
 
   // Cause an inotify event by writing to the watched path.
@@ -394,7 +457,7 @@ TEST_F(INotifyTests, test_inotify_directory_watch) {
 
 TEST_F(INotifyTests, test_inotify_recursion) {
   // Create a non-registered publisher and subscriber.
-  auto pub = std::make_shared<INotifyEventPublisher>();
+  auto pub = std::make_shared<INotifyEventPublisher>(true);
   EventFactory::registerEventPublisher(pub);
   auto sub = std::make_shared<TestINotifyEventSubscriber>();
 
@@ -423,7 +486,7 @@ TEST_F(INotifyTests, test_inotify_recursion) {
   pub->configure();
 
   // Expect only the directories to be monitored.
-  EXPECT_EQ(pub->path_descriptors_.size(), 6U);
+  EXPECT_EQ(pub->path_descriptors_.size(), 11U);
   RemoveAll(pub);
 
   // Use a directory structure that includes a loop.
@@ -436,11 +499,38 @@ TEST_F(INotifyTests, test_inotify_recursion) {
   pub->configure();
 
   // Also expect canonicalized resolution (to prevent loops).
-  EXPECT_EQ(pub->path_descriptors_.size(), 6U);
+  EXPECT_EQ(pub->path_descriptors_.size(), 11U);
   RemoveAll(pub);
 
   // Remove mock directory structure.
   tearDownMockFileStructure();
   EventFactory::deregisterEventPublisher("inotify");
+}
+
+TEST_F(INotifyTests, test_inotify_embedded_wildcards) {
+  // Assume event type is not registered.
+  event_pub_ = std::make_shared<INotifyEventPublisher>(true);
+  EventFactory::registerEventPublisher(event_pub_);
+
+  auto sub = std::make_shared<TestINotifyEventSubscriber>();
+  EventFactory::registerEventSubscriber(sub);
+
+  // Create ./inotify-triggers/2/1/.
+  fs::create_directories(real_test_dir + "/2/1");
+
+  // Create a subscription to match an embedded wildcard: "*"
+  // The assumption is a watch will be created on the 'most-specific' directory
+  // before the wildcard request.
+  auto mc = sub->createSubscriptionContext();
+  mc->path = real_test_dir + "/*/1";
+  mc->recursive = true;
+  sub->subscribe(&TestINotifyEventSubscriber::Callback, mc);
+
+  // Now the publisher must be configured.
+  event_pub_->configure();
+
+  // Assume there is one watched path: real_test_dir.
+  ASSERT_EQ(event_pub_->numDescriptors(), 1U);
+  EXPECT_EQ(event_pub_->path_descriptors_.count(real_test_dir + "/2/1/"), 1U);
 }
 }

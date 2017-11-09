@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -17,7 +17,7 @@
 
 namespace osquery {
 
-extern void escapeNonPrintableBytes(std::string& data);
+extern void escapeNonPrintableBytesEx(std::string& data);
 
 class SQLTests : public testing::Test {};
 
@@ -31,7 +31,10 @@ TEST_F(SQLTests, test_raw_access) {
 class TestTablePlugin : public TablePlugin {
  private:
   TableColumns columns() const {
-    return {{"test_int", INTEGER_TYPE}, {"test_text", TEXT_TYPE}};
+    return {
+        std::make_tuple("test_int", INTEGER_TYPE, ColumnOptions::DEFAULT),
+        std::make_tuple("test_text", TEXT_TYPE, ColumnOptions::DEFAULT),
+    };
   }
 
   QueryData generate(QueryContext& ctx) {
@@ -52,7 +55,8 @@ class TestTablePlugin : public TablePlugin {
 };
 
 TEST_F(SQLTests, test_raw_access_context) {
-  Registry::add<TestTablePlugin>("table", "test");
+  auto tables = RegistryFactory::get().registry("table");
+  tables->add("test", std::make_shared<TestTablePlugin>());
   auto results = SQL::selectAllFrom("test");
 
   EXPECT_EQ(results.size(), 1U);
@@ -68,25 +72,25 @@ TEST_F(SQLTests, test_raw_access_context) {
 
 TEST_F(SQLTests, test_sql_escape) {
   std::string input = "しかたがない";
-  escapeNonPrintableBytes(input);
+  escapeNonPrintableBytesEx(input);
   EXPECT_EQ(input,
             "\\xE3\\x81\\x97\\xE3\\x81\\x8B\\xE3\\x81\\x9F\\xE3\\x81\\x8C\\xE3"
             "\\x81\\xAA\\xE3\\x81\\x84");
 
   input = "悪因悪果";
-  escapeNonPrintableBytes(input);
+  escapeNonPrintableBytesEx(input);
   EXPECT_EQ(input,
             "\\xE6\\x82\\xAA\\xE5\\x9B\\xA0\\xE6\\x82\\xAA\\xE6\\x9E\\x9C");
 
   input = "モンスターハンター";
-  escapeNonPrintableBytes(input);
+  escapeNonPrintableBytesEx(input);
   EXPECT_EQ(input,
             "\\xE3\\x83\\xA2\\xE3\\x83\\xB3\\xE3\\x82\\xB9\\xE3\\x82\\xBF\\xE3"
             "\\x83\\xBC\\xE3\\x83\\x8F\\xE3\\x83\\xB3\\xE3\\x82\\xBF\\xE3\\x83"
             "\\xBC");
 
   input = "съешь же ещё этих мягких французских булок, да выпей чаю";
-  escapeNonPrintableBytes(input);
+  escapeNonPrintableBytesEx(input);
   EXPECT_EQ(
       input,
       "\\xD1\\x81\\xD1\\x8A\\xD0\\xB5\\xD1\\x88\\xD1\\x8C \\xD0\\xB6\\xD0\\xB5 "
@@ -99,7 +103,55 @@ TEST_F(SQLTests, test_sql_escape) {
       "\\xD1\\x87\\xD0\\xB0\\xD1\\x8E");
 
   input = "The quick brown fox jumps over the lazy dog.";
-  escapeNonPrintableBytes(input);
+  escapeNonPrintableBytesEx(input);
   EXPECT_EQ(input, "The quick brown fox jumps over the lazy dog.");
+}
+
+TEST_F(SQLTests, test_sql_base64_encode) {
+  QueryData d;
+  query("select to_base64('test') as test;", d);
+  EXPECT_EQ(d.size(), 1U);
+  EXPECT_EQ(d[0]["test"], "dGVzdA==");
+}
+
+TEST_F(SQLTests, test_sql_base64_decode) {
+  QueryData d;
+  query("select from_base64('dGVzdA==') as test;", d);
+  EXPECT_EQ(d.size(), 1U);
+  EXPECT_EQ(d[0]["test"], "test");
+}
+
+TEST_F(SQLTests, test_sql_base64_conditional_encode) {
+  QueryData d;
+  query("select conditional_to_base64('test') as test;", d);
+  EXPECT_EQ(d.size(), 1U);
+  EXPECT_EQ(d[0]["test"], "test");
+
+  QueryData d2;
+  query("select conditional_to_base64('悪因悪果') as test;", d2);
+  EXPECT_EQ(d2.size(), 1U);
+  EXPECT_EQ(d2[0]["test"], "5oKq5Zug5oKq5p6c");
+}
+
+TEST_F(SQLTests, test_sql_md5) {
+  QueryData d;
+  query("select md5('test') as test;", d);
+  EXPECT_EQ(d.size(), 1U);
+  EXPECT_EQ(d[0]["test"], "098f6bcd4621d373cade4e832627b4f6");
+}
+
+TEST_F(SQLTests, test_sql_sha1) {
+  QueryData d;
+  query("select sha1('test') as test;", d);
+  EXPECT_EQ(d.size(), 1U);
+  EXPECT_EQ(d[0]["test"], "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3");
+}
+
+TEST_F(SQLTests, test_sql_sha256) {
+  QueryData d;
+  query("select sha256('test') as test;", d);
+  EXPECT_EQ(d.size(), 1U);
+  EXPECT_EQ(d[0]["test"],
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
 }
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,44 +10,9 @@
 
 #pragma once
 
-#include <openssl/ssl.h>
-#include <openssl/crypto.h>
-
-#ifndef OPENSSL_NO_SSL2
-#define OPENSSL_NO_SSL2 1
-#endif
-
-#ifndef OPENSSL_NO_SSL3
-#define OPENSSL_NO_SSL3 1
-#endif
-
-#define OPENSSL_NO_MD5 1
-#define OPENSSL_NO_DEPRECATED 1
-
-/// Newer versions of LibreSSL will lack SSL methods.
-extern "C" {
-#if defined(NO_SSL_TXT_SSLV3)
-SSL_METHOD* SSLv3_server_method(void);
-SSL_METHOD* SSLv3_client_method(void);
-SSL_METHOD* SSLv3_method(void);
-#endif
-void ERR_remove_state(unsigned long);
-}
-
-// Our third-party version of cpp-netlib uses OpenSSL APIs.
-// On OS X these symbols are marked deprecated and clang will warn against
-// us including them. We are squashing the noise for OS X's OpenSSL only.
-#if defined(DARWIN)
-_Pragma("clang diagnostic push")
-_Pragma("clang diagnostic ignored \"-Wdeprecated-declarations\"")
-#endif
-#include <boost/network/protocol/http/client.hpp>
-#if defined(DARWIN)
-_Pragma("clang diagnostic pop")
-#endif
-
 #include <osquery/flags.h>
 
+#include "osquery/remote/http_client.h"
 #include "osquery/remote/requests.h"
 
 namespace osquery {
@@ -55,7 +20,8 @@ namespace osquery {
 /// Path to optional TLS client secret key, used for enrollment/requests.
 DECLARE_string(tls_client_key);
 
-/// Path to optional TLS client certificate (PEM), used for enrollment/requests.
+/// Path to optional TLS client certificate (PEM), used for
+/// enrollment/requests.
 DECLARE_string(tls_client_cert);
 
 /// TLS server hostname.
@@ -81,7 +47,7 @@ class TLSTransport : public Transport {
    * Return code (1) for general connectivity problems, return code (2) for TLS
    * specific errors.
    */
-  Status sendRequest();
+  Status sendRequest() override;
 
   /**
    * @brief Send a simple request to the destination with parameters
@@ -92,22 +58,23 @@ class TLSTransport : public Transport {
    * Return code (1) for general connectivity problems, return code (2) for TLS
    * specific errors.
    */
-  Status sendRequest(const std::string& params);
+  Status sendRequest(const std::string& params, bool compress = false) override;
 
   /**
    * @brief Class destructor
-  */
+   */
   virtual ~TLSTransport() {}
 
  public:
   TLSTransport();
 
- protected:
-  boost::network::http::client getClient();
+  http::Client::Options getOptions();
 
  private:
   /// Testing-only, disable peer verification.
-  void disableVerifyPeer() { verify_peer_ = false; }
+  void disableVerifyPeer() {
+    verify_peer_ = false;
+  }
 
   /// Set TLS-client authentication options.
   void setClientCertificate(const std::string& certificate_file,
@@ -136,15 +103,15 @@ class TLSTransport : public Transport {
 
  protected:
   /**
-    * @brief Modify a request object with base modifications
-    *
-    * @param The request object, to be modified
-    */
-  void decorateRequest(boost::network::http::client::request& r);
+   * @brief Modify a request object with base modifications
+   *
+   * @param The request object, to be modified
+   */
+  void decorateRequest(http::Request& r);
 
  protected:
   /// Storage for the HTTP response object
-  boost::network::http::client::response response_;
+  http::Response response_;
 
  private:
   FRIEND_TEST(TLSTransportsTests, test_call);

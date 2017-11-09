@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -55,7 +55,7 @@ Status HardwareEventSubscriber::Callback(
   r["vendor"] = ec->vendor;
   r["serial"] = ec->serial;
   r["revision"] = ec->version;
-  add(r, ec->time);
+  add(r);
   return Status(0, "OK");
 }
 }

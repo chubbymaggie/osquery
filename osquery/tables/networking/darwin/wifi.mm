@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,17 +8,17 @@
  *
  */
 
-#include <iomanip>
-
 #include <CoreFoundation/CoreFoundation.h>
 #include <Foundation/Foundation.h>
 
 #include <osquery/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/sql.h>
+#include <osquery/system.h>
 #include <osquery/tables.h>
 
 #include "osquery/core/conversions.h"
+#include "osquery/tables/networking/darwin/wifi_utils.h"
 
 namespace osquery {
 namespace tables {
@@ -52,22 +52,6 @@ Status getKnownNetworksKey(std::string& key) {
             ? "RememberedNetworks"
             : "KnownNetworks";
   return Status(0, "ok");
-}
-
-// SSIDs have no character set associated with them
-// mirror Apple's representation of them
-std::string extractSsid(const CFDataRef& data) {
-  std::stringstream ss;
-  auto bytes = CFDataGetBytePtr(data);
-  auto length = CFDataGetLength(data);
-  for (CFIndex i = 0; i < length; i++) {
-    if (i > 0 && i % 4 == 0) {
-      ss << " ";
-    }
-    ss << std::setfill('0') << std::setw(2) << std::hex
-       << (unsigned int)bytes[i];
-  }
-  return ss.str();
 }
 
 std::string extractNetworkProperties(const CFTypeRef& property) {
@@ -156,10 +140,10 @@ QueryData genKnownWifiNetworks(QueryContext& context) {
     }
   } else if (CFGetTypeID(networks) == CFDictionaryGetTypeID()) {
     auto count = CFDictionaryGetCount((CFDictionaryRef)networks);
-    const void* keys[count];
-    const void* values[count];
-    CFDictionaryGetKeysAndValues((CFDictionaryRef)networks, keys, values);
-
+    std::vector<const void *> keys(count);
+    std::vector<const void *> values(count);
+    CFDictionaryGetKeysAndValues((CFDictionaryRef)networks, keys.data(),
+                                 values.data());
     for (CFIndex i = 0; i < count; i++) {
       parseNetworks((CFDictionaryRef)values[i], results);
     }

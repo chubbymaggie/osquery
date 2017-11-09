@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,10 +12,10 @@
 
 #include <osquery/logger.h>
 
-#include <libiptc/libiptc.h>
 #include <arpa/inet.h>
+#include <libiptc/libiptc.h>
 
-#include "osquery/core/test_util.h"
+#include "osquery/tests/test_util.h"
 
 namespace osquery {
 namespace tables {
@@ -62,5 +62,5 @@ TEST_F(IptablesTests, test_iptables_ip_entry) {
   parseIpEntry(getIpEntryContent(), row);
   EXPECT_EQ(row, getIpEntryExpectedResults());
 }
-}
-}
+} // namespace tables
+} // namespace osquery

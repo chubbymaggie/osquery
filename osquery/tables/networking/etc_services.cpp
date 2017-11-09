@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,24 +8,36 @@
  *
  */
 
-#include <vector>
 #include <string>
+#include <vector>
 
 #include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem/path.hpp>
 
 #include <osquery/core.h>
+#include <osquery/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/tables.h>
-#include <osquery/filesystem.h>
+
+#include "osquery/core/conversions.h"
+#include "osquery/filesystem/fileops.h"
+
+namespace fs = boost::filesystem;
 
 namespace osquery {
 namespace tables {
 
+#ifndef WIN32
+fs::path kEtcServices = "/etc/services";
+#else
+fs::path kEtcServices = (getSystemRoot() / "system32\\drivers\\etc\\services");
+#endif
+
 QueryData parseEtcServicesContent(const std::string& content) {
   QueryData results;
 
-  for (const auto& line : split(content, "\n")) {
+  for (const auto& line : osquery::split(content, "\n")) {
     // Empty line or comment.
     if (line.size() == 0 || boost::starts_with(line, "#")) {
       continue;
@@ -35,20 +47,20 @@ QueryData parseEtcServicesContent(const std::string& content) {
     // [1]: [comment part1]
     // [2]: [comment part2]
     // [n]: [comment partn]
-    auto service_info_comment = split(line, "#");
+    auto service_info_comment = osquery::split(line, "#");
 
     // [0]: name
     // [1]: port/protocol
     // [2]: [aliases0]
     // [3]: [aliases1]
     // [n]: [aliasesn]
-    auto service_info = split(service_info_comment[0]);
+    auto service_info = osquery::split(service_info_comment[0]);
     if (service_info.size() < 2) {
       continue;
     }
 
     // [0]: port [1]: protocol
-    auto service_port_protocol = split(service_info[1], "/");
+    auto service_port_protocol = osquery::split(service_info[1], "/");
     if (service_port_protocol.size() != 2) {
       continue;
     }
@@ -76,10 +88,11 @@ QueryData parseEtcServicesContent(const std::string& content) {
 
 QueryData genEtcServices(QueryContext& context) {
   std::string content;
-  auto s = osquery::forensicReadFile("/etc/services", content);
+  auto s = readFile(kEtcServices, content);
   if (s.ok()) {
     return parseEtcServicesContent(content);
   } else {
+    TLOG << "Error reading " << kEtcServices << ": " << s.toString();
     return {};
   }
 }

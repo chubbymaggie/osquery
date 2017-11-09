@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,29 +8,47 @@
  *
  */
 
-#include <chrono>
-#include <mutex>
-#include <random>
+#include <map>
+#include <string>
+#include <vector>
 
+#include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/trim.hpp>
-#include <boost/property_tree/json_parser.hpp>
-#include <boost/thread/shared_mutex.hpp>
+#include <boost/iterator/filter_iterator.hpp>
 
 #include <osquery/config.h>
 #include <osquery/database.h>
+#include <osquery/events.h>
 #include <osquery/flags.h>
-#include <osquery/hash.h>
-#include <osquery/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/packs.h>
 #include <osquery/registry.h>
 #include <osquery/tables.h>
 
 #include "osquery/core/conversions.h"
+#include "osquery/core/json.h"
 
 namespace pt = boost::property_tree;
 
 namespace osquery {
+
+/**
+ * @brief Config plugin registry.
+ *
+ * This creates an osquery registry for "config" which may implement
+ * ConfigPlugin. A ConfigPlugin's call API should make use of a genConfig
+ * after reading JSON data in the plugin implementation.
+ */
+CREATE_REGISTRY(ConfigPlugin, "config");
+
+/**
+ * @brief ConfigParser plugin registry.
+ *
+ * This creates an osquery registry for "config_parser" which may implement
+ * ConfigParserPlugin. A ConfigParserPlugin should not export any call actions
+ * but rather have a simple property tree-accessor API through Config.
+ */
+CREATE_LAZY_REGISTRY(ConfigParserPlugin, "config_parser");
 
 /// The config plugin must be known before reading options.
 CLI_FLAG(string, config_plugin, "filesystem", "Config plugin name");
@@ -42,9 +60,23 @@ CLI_FLAG(bool,
 
 CLI_FLAG(bool, config_dump, false, "Dump the contents of the configuration");
 
+CLI_FLAG(uint64,
+         config_refresh,
+         0,
+         "Optional interval in seconds to re-read configuration");
+FLAG_ALIAS(google::uint64, config_tls_refresh, config_refresh);
+
+/// How long to wait when config update fails
+CLI_FLAG(uint64,
+         config_accelerated_refresh,
+         300,
+         "Interval to wait if reading a configuration fails");
+FLAG_ALIAS(google::uint64,
+           config_tls_accelerated_refresh,
+           config_accelerated_refresh);
+
 DECLARE_string(config_plugin);
 DECLARE_string(pack_delimiter);
-DECLARE_bool(disable_events);
 
 /**
  * @brief The backing store key name for the executing query.
@@ -53,15 +85,23 @@ DECLARE_bool(disable_events);
  * On process or worker resume an initializer or config may check if the
  * resume was the result of a failure during an executing query.
  */
-const std::string kExecutingQuery = "executing_query";
-const std::string kFailedQueries = "failed_queries";
+const std::string kExecutingQuery{"executing_query"};
+const std::string kFailedQueries{"failed_queries"};
+
+/// The time osquery was started.
+std::atomic<size_t> kStartTime;
 
 // The config may be accessed and updated asynchronously; use mutexes.
-boost::shared_mutex config_schedule_mutex_;
-boost::shared_mutex config_performance_mutex_;
-boost::shared_mutex config_files_mutex_;
-boost::shared_mutex config_hash_mutex_;
-boost::shared_mutex config_valid_mutex_;
+Mutex config_hash_mutex_;
+Mutex config_valid_mutex_;
+Mutex config_refresh_mutex_;
+
+/// Several config methods require enumeration via predicate lambdas.
+RecursiveMutex config_schedule_mutex_;
+RecursiveMutex config_files_mutex_;
+RecursiveMutex config_performance_mutex_;
+
+using PackRef = std::shared_ptr<Pack>;
 
 /**
  * The schedule is an iterable collection of Packs. When you iterate through
@@ -71,7 +111,7 @@ boost::shared_mutex config_valid_mutex_;
 class Schedule : private boost::noncopyable {
  public:
   /// Under the hood, the schedule is just a list of the Pack objects
-  using container = std::list<Pack>;
+  using container = std::list<PackRef>;
 
   /**
    * @brief Create a schedule maintained by the configuration.
@@ -90,24 +130,27 @@ class Schedule : private boost::noncopyable {
    * next iterator element or skipped.
    */
   struct Step {
-    bool operator()(Pack& pack) { return pack.shouldPackExecute(); }
+    bool operator()(PackRef& pack) {
+      return pack->shouldPackExecute();
+    }
   };
 
   /// Add a pack to the schedule
-  void add(const Pack& pack) {
-    remove(pack.getName(), pack.getSource());
+  void add(PackRef&& pack) {
+    remove(pack->getName(), pack->getSource());
     packs_.push_back(pack);
   }
 
   /// Remove a pack, by name.
-  void remove(const std::string& pack) { remove(pack, ""); }
+  void remove(const std::string& pack) {
+    remove(pack, "");
+  }
 
   /// Remove a pack by name and source.
   void remove(const std::string& pack, const std::string& source) {
-    packs_.remove_if([pack, source](Pack& p) {
-      if (p.getName() == pack && (p.getSource() == source || source == "")) {
-        Config::getInstance().removeFiles(source + FLAGS_pack_delimiter +
-                                          p.getName());
+    packs_.remove_if([pack, source](PackRef& p) {
+      if (p->getName() == pack && (p->getSource() == source || source == "")) {
+        Config::get().removeFiles(source + FLAGS_pack_delimiter + p->getName());
         return true;
       }
       return false;
@@ -116,10 +159,9 @@ class Schedule : private boost::noncopyable {
 
   /// Remove all packs by source.
   void removeAll(const std::string& source) {
-    packs_.remove_if(([source](Pack& p) {
-      if (p.getSource() == source) {
-        Config::getInstance().removeFiles(source + FLAGS_pack_delimiter +
-                                          p.getName());
+    packs_.remove_if(([source](PackRef& p) {
+      if (p->getSource() == source) {
+        Config::get().removeFiles(source + FLAGS_pack_delimiter + p->getName());
         return true;
       }
       return false;
@@ -129,8 +171,17 @@ class Schedule : private boost::noncopyable {
   /// Boost gives us a nice template for maintaining the state of the iterator
   using iterator = boost::filter_iterator<Step, container::iterator>;
 
-  iterator begin() { return iterator(packs_.begin(), packs_.end()); }
-  iterator end() { return iterator(packs_.end(), packs_.end()); }
+  iterator begin() {
+    return iterator(packs_.begin(), packs_.end());
+  }
+
+  iterator end() {
+    return iterator(packs_.end(), packs_.end());
+  }
+
+  PackRef& last() {
+    return packs_.back();
+  }
 
  private:
   /// Underlying storage for the packs
@@ -157,6 +208,30 @@ class Schedule : private boost::noncopyable {
   friend class Config;
 };
 
+/**
+ * @brief A thread that periodically reloads configuration state.
+ *
+ * This refresh runner thread can refresh any configuration plugin.
+ * It may accelerate the time between checks if the configuration fails to load.
+ * For configurations pulled from the network this assures that configuration
+ * is fresh when re-attaching.
+ */
+class ConfigRefreshRunner : public InternalRunnable {
+ public:
+  ConfigRefreshRunner() : InternalRunnable("ConfigRefreshRunner") {}
+
+  /// A simple wait/interruptible lock.
+  void start();
+
+ private:
+  /// The current refresh rate in seconds.
+  std::atomic<size_t> refresh_{0};
+  std::atomic<size_t> mod_{1000};
+
+ private:
+  friend class Config;
+};
+
 void restoreScheduleBlacklist(std::map<std::string, size_t>& blacklist) {
   std::string content;
   getDatabaseValue(kPersistentSettings, kFailedQueries, content);
@@ -169,8 +244,8 @@ void restoreScheduleBlacklist(std::map<std::string, size_t>& blacklist) {
   size_t current_time = getUnixTime();
   for (size_t i = 0; i < blacklist_pairs.size() / 2; i++) {
     // Fill in a mapping of query name to time the blacklist expires.
-    long int expire = 0;
-    safeStrtol(blacklist_pairs[(i * 2) + 1], 10, expire);
+    long long expire = 0;
+    safeStrtoll(blacklist_pairs[(i * 2) + 1], 10, expire);
     if (expire > 0 && current_time < (size_t)expire) {
       blacklist[blacklist_pairs[(i * 2)]] = (size_t)expire;
     }
@@ -189,7 +264,7 @@ void saveScheduleBlacklist(const std::map<std::string, size_t>& blacklist) {
 }
 
 Schedule::Schedule() {
-  if (Registry::external()) {
+  if (RegistryFactory::get().external()) {
     // Extensions should not restore or save schedule details.
     return;
   }
@@ -210,48 +285,74 @@ Schedule::Schedule() {
 Config::Config()
     : schedule_(std::make_shared<Schedule>()),
       valid_(false),
-      start_time_(std::time(nullptr)) {}
+      refresh_runner_(std::make_shared<ConfigRefreshRunner>()) {}
 
 void Config::addPack(const std::string& name,
                      const std::string& source,
                      const pt::ptree& tree) {
-  WriteLock wlock(config_schedule_mutex_);
-  try {
-    schedule_->add(Pack(name, source, tree));
-    applyParsers(source + FLAGS_pack_delimiter + name, tree, true);
-  } catch (const std::exception& e) {
-    LOG(WARNING) << "Error adding pack: " << name << ": " << e.what();
+  auto addSinglePack = ([this, &source](const std::string pack_name,
+                                        const pt::ptree& pack_tree) {
+    RecursiveLock wlock(config_schedule_mutex_);
+    try {
+      schedule_->add(std::make_shared<Pack>(pack_name, source, pack_tree));
+      if (schedule_->last()->shouldPackExecute()) {
+        applyParsers(
+            source + FLAGS_pack_delimiter + pack_name, pack_tree, true);
+      }
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Error adding pack: " << pack_name << ": " << e.what();
+    }
+  });
+
+  if (name == "*") {
+    // This is a multi-pack, expect the config plugin to have generated a
+    // "name": {pack-content} response similar to embedded pack content
+    // within the configuration.
+    for (const auto& pack : tree) {
+      addSinglePack(pack.first, pack.second);
+    }
+  } else {
+    addSinglePack(name, tree);
   }
 }
 
+size_t Config::getStartTime() {
+  return kStartTime;
+}
+
+void Config::setStartTime(size_t st) {
+  kStartTime = st;
+}
+
 void Config::removePack(const std::string& pack) {
-  WriteLock wlock(config_schedule_mutex_);
+  RecursiveLock wlock(config_schedule_mutex_);
   return schedule_->remove(pack);
 }
 
 void Config::addFile(const std::string& source,
                      const std::string& category,
                      const std::string& path) {
-  WriteLock wlock(config_files_mutex_);
+  RecursiveLock wlock(config_files_mutex_);
   files_[source][category].push_back(path);
 }
 
 void Config::removeFiles(const std::string& source) {
-  WriteLock wlock(config_files_mutex_);
+  RecursiveLock wlock(config_files_mutex_);
   if (files_.count(source)) {
     FileCategories().swap(files_[source]);
   }
 }
 
-void Config::scheduledQueries(std::function<
-    void(const std::string& name, const ScheduledQuery& query)> predicate) {
-  ReadLock rlock(config_schedule_mutex_);
-  for (const Pack& pack : *schedule_) {
-    for (const auto& it : pack.getSchedule()) {
+void Config::scheduledQueries(
+    std::function<void(const std::string& name, const ScheduledQuery& query)>
+        predicate) {
+  RecursiveLock lock(config_schedule_mutex_);
+  for (const PackRef& pack : *schedule_) {
+    for (const auto& it : pack->getSchedule()) {
       std::string name = it.first;
       // The query name may be synthetic.
-      if (pack.getName() != "main" && pack.getName() != "legacy_main") {
-        name = "pack" + FLAGS_pack_delimiter + pack.getName() +
+      if (pack->getName() != "main" && pack->getName() != "legacy_main") {
+        name = "pack" + FLAGS_pack_delimiter + pack->getName() +
                FLAGS_pack_delimiter + it.first;
       }
       // They query may have failed and been added to the schedule's blacklist.
@@ -272,24 +373,29 @@ void Config::scheduledQueries(std::function<
   }
 }
 
-void Config::packs(std::function<void(Pack& pack)> predicate) {
-  ReadLock rlock(config_schedule_mutex_);
-  for (Pack& pack : schedule_->packs_) {
+void Config::packs(std::function<void(PackRef& pack)> predicate) {
+  RecursiveLock lock(config_schedule_mutex_);
+  for (PackRef& pack : schedule_->packs_) {
     predicate(pack);
   }
 }
 
-Status Config::load() {
-  valid_ = false;
-  auto& config_plugin = Registry::getActive("config");
-  if (!Registry::exists("config", config_plugin)) {
-    return Status(1, "Missing config plugin " + config_plugin);
-  }
-
+Status Config::refresh() {
   PluginResponse response;
   auto status = Registry::call("config", {{"action", "genConfig"}}, response);
+
+  WriteLock lock(config_refresh_mutex_);
   if (!status.ok()) {
+    if (FLAGS_config_refresh > 0 && getRefresh() == FLAGS_config_refresh) {
+      VLOG(1) << "Using accelerated configuration delay";
+      setRefresh(FLAGS_config_accelerated_refresh);
+    }
+
+    loaded_ = true;
     return status;
+  } else if (getRefresh() != FLAGS_config_refresh) {
+    VLOG(1) << "Normal configuration delay restored";
+    setRefresh(FLAGS_config_refresh);
   }
 
   // if there was a response, parse it and update internal state
@@ -303,7 +409,9 @@ Status Config::load() {
                 content.first.c_str(),
                 content.second.c_str());
       }
-      ::exit(EXIT_SUCCESS);
+      // Don't force because the config plugin may have started services.
+      Initializer::requestShutdown();
+      return Status();
     }
     status = update(response[0]);
   }
@@ -312,16 +420,44 @@ Status Config::load() {
   return status;
 }
 
-/**
- * @brief Boost's 1.59 property tree based JSON parser does not accept comments.
- *
- * For semi-compatibility with existing configurations we will attempt to strip
- * hash and C++ style comments. It is OK for the config update to be latent
- * as it is a single event. But some configuration plugins may update running
- * configurations.
- */
-inline void stripConfigComments(std::string& json) {
+void Config::setRefresh(size_t refresh, size_t mod) {
+  refresh_runner_->refresh_ = refresh;
+  if (mod > 0) {
+    refresh_runner_->mod_ = mod;
+  }
+}
+
+size_t Config::getRefresh() const {
+  return refresh_runner_->refresh_;
+}
+
+Status Config::load() {
+  valid_ = false;
+  auto config_plugin = RegistryFactory::get().getActive("config");
+  if (!RegistryFactory::get().exists("config", config_plugin)) {
+    return Status(1, "Missing config plugin " + config_plugin);
+  }
+
+  // Set the initial and optional refresh value.
+  setRefresh(FLAGS_config_refresh);
+
+  /*
+   * If the initial configuration includes a non-0 refresh, start an
+   * additional service that sleeps and periodically regenerates the
+   * configuration.
+   */
+  if (!FLAGS_config_check && !started_thread_ && getRefresh() > 0) {
+    Dispatcher::addService(refresh_runner_);
+    started_thread_ = true;
+  }
+
+  return refresh();
+}
+
+void stripConfigComments(std::string& json) {
   std::string sink;
+
+  boost::replace_all(json, "\\\n", "");
   for (auto& line : osquery::split(json, "\n")) {
     boost::trim(line);
     if (line.size() > 0 && line[0] == '#') {
@@ -335,14 +471,22 @@ inline void stripConfigComments(std::string& json) {
   json = sink;
 }
 
-Status Config::updateSource(const std::string& name, const std::string& json) {
+Status Config::updateSource(const std::string& source,
+                            const std::string& json) {
   // Compute a 'synthesized' hash using the content before it is parsed.
-  hashSource(name, json);
+  if (!hashSource(source, json)) {
+    // This source did not change, the returned status allows the caller to
+    // choose to reconfigure if any sources had changed.
+    return Status(2);
+  }
 
-  // Remove all packs from this source.
-  schedule_->removeAll(name);
-  // Remove all files from this source.
-  removeFiles(name);
+  {
+    RecursiveLock lock(config_schedule_mutex_);
+    // Remove all packs from this source.
+    schedule_->removeAll(source);
+    // Remove all files from this source.
+    removeFiles(source);
+  }
 
   // load the config (source.second) into a pt::ptree
   pt::ptree tree;
@@ -352,19 +496,20 @@ Status Config::updateSource(const std::string& name, const std::string& json) {
     std::stringstream json_stream;
     json_stream << clone;
     pt::read_json(json_stream, tree);
-  } catch (const pt::json_parser::json_parser_error& e) {
+  } catch (const pt::json_parser::json_parser_error& /* e */) {
     return Status(1, "Error parsing the config JSON");
   }
 
   // extract the "schedule" key and store it as the main pack
-  if (tree.count("schedule") > 0 && !Registry::external()) {
+  auto& rf = RegistryFactory::get();
+  if (tree.count("schedule") > 0 && !rf.external()) {
     auto& schedule = tree.get_child("schedule");
     pt::ptree main_pack;
     main_pack.add_child("queries", schedule);
-    addPack("main", name, main_pack);
+    addPack("main", source, main_pack);
   }
 
-  if (tree.count("scheduledQueries") > 0 && !Registry::external()) {
+  if (tree.count("scheduledQueries") > 0 && !rf.external()) {
     auto& scheduled_queries = tree.get_child("scheduledQueries");
     pt::ptree queries;
     for (const std::pair<std::string, pt::ptree>& query : scheduled_queries) {
@@ -376,55 +521,70 @@ Status Config::updateSource(const std::string& name, const std::string& json) {
     }
     pt::ptree legacy_pack;
     legacy_pack.add_child("queries", queries);
-    addPack("legacy_main", name, legacy_pack);
+    addPack("legacy_main", source, legacy_pack);
   }
 
   // extract the "packs" key into additional pack objects
-  if (tree.count("packs") > 0 && !Registry::external()) {
+  if (tree.count("packs") > 0 && !rf.external()) {
     auto& packs = tree.get_child("packs");
     for (const auto& pack : packs) {
       auto value = packs.get<std::string>(pack.first, "");
       if (value.empty()) {
         // The pack is a JSON object, treat the content as pack data.
-        addPack(pack.first, name, pack.second);
+        addPack(pack.first, source, pack.second);
       } else {
-        // If the pack value is a string (and not a JSON object) then it is a
-        // resource to be handled by the config plugin.
-        PluginResponse response;
-        PluginRequest request = {
-            {"action", "genPack"}, {"name", pack.first}, {"value", value}};
-        Registry::call("config", request, response);
-
-        if (response.size() == 0 || response[0].count(pack.first) == 0) {
-          continue;
-        }
-
-        try {
-          pt::ptree pack_tree;
-          std::stringstream pack_stream;
-          pack_stream << response[0][pack.first];
-          pt::read_json(pack_stream, pack_tree);
-          addPack(pack.first, name, pack_tree);
-        } catch (const pt::json_parser::json_parser_error& e) {
-          LOG(WARNING) << "Error parsing the pack JSON: " << pack.first;
-        }
+        genPack(pack.first, source, value);
       }
     }
   }
 
-  applyParsers(name, tree, false);
+  applyParsers(source, tree, false);
   return Status(0, "OK");
+}
+
+Status Config::genPack(const std::string& name,
+                       const std::string& source,
+                       const std::string& target) {
+  // If the pack value is a string (and not a JSON object) then it is a
+  // resource to be handled by the config plugin.
+  PluginResponse response;
+  PluginRequest request = {
+      {"action", "genPack"}, {"name", name}, {"value", target}};
+  Registry::call("config", request, response);
+
+  if (response.size() == 0 || response[0].count(name) == 0) {
+    return Status(1, "Invalid plugin response");
+  }
+
+  try {
+    auto clone = response[0][name];
+    if (clone == "") {
+      LOG(WARNING) << "Error reading the query pack named: " << name;
+      return Status(0);
+    }
+    stripConfigComments(clone);
+    pt::ptree pack_tree;
+    std::stringstream pack_stream;
+    pack_stream << clone;
+    pt::read_json(pack_stream, pack_tree);
+    addPack(name, source, pack_tree);
+  } catch (const pt::json_parser::json_parser_error& e) {
+    LOG(WARNING) << "Error parsing the \"" << name
+                 << "\" pack JSON: " << e.what();
+  }
+  return Status(0);
 }
 
 void Config::applyParsers(const std::string& source,
                           const pt::ptree& tree,
                           bool pack) {
   // Iterate each parser.
-  for (const auto& plugin : Registry::all("config_parser")) {
+  RecursiveLock lock(config_schedule_mutex_);
+  for (const auto& plugin : RegistryFactory::get().plugins("config_parser")) {
     std::shared_ptr<ConfigParserPlugin> parser = nullptr;
     try {
       parser = std::dynamic_pointer_cast<ConfigParserPlugin>(plugin.second);
-    } catch (const std::bad_cast& e) {
+    } catch (const std::bad_cast& /* e */) {
       LOG(ERROR) << "Error casting config parser plugin: " << plugin.first;
     }
     if (parser == nullptr || parser.get() == nullptr) {
@@ -451,7 +611,7 @@ Status Config::update(const std::map<std::string, std::string>& config) {
   // A config plugin may call update from an extension. This will update
   // the config instance within the extension process and the update must be
   // reflected in the core.
-  if (Registry::external()) {
+  if (RegistryFactory::get().external()) {
     for (const auto& source : config) {
       PluginRequest request = {
           {"action", "update"},
@@ -471,18 +631,28 @@ Status Config::update(const std::map<std::string, std::string>& config) {
   // Before this occurs, take an opportunity to purge stale state.
   purge();
 
+  bool needs_reconfigure = false;
   for (const auto& source : config) {
     auto status = updateSource(source.first, source.second);
+    if (status.getCode() == 2) {
+      // The source content did not change.
+      continue;
+    }
+
     if (!status.ok()) {
+      // The content was not parsed correctly.
       return status;
     }
+    // If a source was updated and the content has changed, then the registry
+    // should be reconfigured. File watches may have changed, etc.
+    needs_reconfigure = true;
   }
 
-  if (loaded_) {
+  if (loaded_ && needs_reconfigure) {
     // The config has since been loaded.
     // This update call is most likely a response to an async update request
     // from a config plugin. This request should request all plugins to update.
-    for (const auto& registry : Registry::all()) {
+    for (const auto& registry : RegistryFactory::get().all()) {
       if (registry.first == "event_publisher" ||
           registry.first == "event_subscriber") {
         continue;
@@ -490,11 +660,7 @@ Status Config::update(const std::map<std::string, std::string>& config) {
       registry.second->configure();
     }
 
-    // If events are enabled configure the subscribers before publishers.
-    if (!FLAGS_disable_events) {
-      Registry::registry("event_subscriber")->configure();
-      Registry::registry("event_publisher")->configure();
-    }
+    EventFactory::configUpdate();
   }
 
   return Status(0, "OK");
@@ -508,7 +674,7 @@ void Config::purge() {
   const auto& schedule = this->schedule_;
   auto queryExists = [&schedule](const std::string& query_name) {
     for (const auto& pack : schedule->packs_) {
-      const auto& pack_queries = pack.getSchedule();
+      const auto& pack_queries = pack->getSchedule();
       if (pack_queries.count(query_name)) {
         return true;
       }
@@ -516,7 +682,7 @@ void Config::purge() {
     return false;
   };
 
-  ReadLock rlock(config_schedule_mutex_);
+  RecursiveLock lock(config_schedule_mutex_);
   // Iterate over each result set in the database.
   for (const auto& saved_query : saved_queries) {
     if (queryExists(saved_query)) {
@@ -538,7 +704,7 @@ void Config::purge() {
     size_t last_executed = 0;
     try {
       last_executed = boost::lexical_cast<size_t>(content);
-    } catch (const boost::bad_lexical_cast& e) {
+    } catch (const boost::bad_lexical_cast& /* e */) {
       // Erase the timestamp as is it potentially corrupt.
       deleteDatabaseValue(kPersistentSettings, "timestamp." + saved_query);
       continue;
@@ -547,10 +713,46 @@ void Config::purge() {
     if (last_executed < getUnixTime() - 592200) {
       // Query has not run in the last week, expire results and interval.
       deleteDatabaseValue(kQueries, saved_query);
+      deleteDatabaseValue(kQueries, saved_query + "epoch");
       deleteDatabaseValue(kPersistentSettings, "interval." + saved_query);
       deleteDatabaseValue(kPersistentSettings, "timestamp." + saved_query);
       VLOG(1) << "Expiring results for scheduled query: " << saved_query;
     }
+  }
+}
+
+void Config::reset() {
+  setStartTime(getUnixTime());
+
+  schedule_ = std::make_shared<Schedule>();
+  std::map<std::string, QueryPerformance>().swap(performance_);
+  std::map<std::string, FileCategories>().swap(files_);
+  std::map<std::string, std::string>().swap(hash_);
+  valid_ = false;
+  loaded_ = false;
+
+  refresh_runner_ = std::make_shared<ConfigRefreshRunner>();
+  started_thread_ = false;
+
+  // Also request each parse to reset state.
+  for (const auto& plugin : RegistryFactory::get().plugins("config_parser")) {
+    std::shared_ptr<ConfigParserPlugin> parser = nullptr;
+    try {
+      parser = std::dynamic_pointer_cast<ConfigParserPlugin>(plugin.second);
+    } catch (const std::bad_cast& /* e */) {
+      continue;
+    }
+    if (parser == nullptr || parser.get() == nullptr) {
+      continue;
+    }
+    parser->reset();
+  }
+}
+
+void ConfigParserPlugin::reset() {
+  // Resets will clear all top-level keys from the parser's data store.
+  for (auto& category : data_) {
+    boost::property_tree::ptree().swap(category.second);
   }
 }
 
@@ -559,7 +761,7 @@ void Config::recordQueryPerformance(const std::string& name,
                                     size_t size,
                                     const Row& r0,
                                     const Row& r1) {
-  WriteLock wlock(config_performance_mutex_);
+  RecursiveLock lock(config_performance_mutex_);
   if (performance_.count(name) == 0) {
     performance_[name] = QueryPerformance();
   }
@@ -617,23 +819,28 @@ void Config::getPerformanceStats(
     const std::string& name,
     std::function<void(const QueryPerformance& query)> predicate) {
   if (performance_.count(name) > 0) {
-    ReadLock rlock(config_performance_mutex_);
+    RecursiveLock lock(config_performance_mutex_);
     predicate(performance_.at(name));
   }
 }
 
-void Config::hashSource(const std::string& source, const std::string& content) {
+bool Config::hashSource(const std::string& source, const std::string& content) {
+  auto new_hash = getBufferSHA1(content.c_str(), content.size());
+
   WriteLock wlock(config_hash_mutex_);
-  hash_[source] =
-      hashFromBuffer(HASH_TYPE_MD5, &(content.c_str())[0], content.size());
+  if (hash_[source] == new_hash) {
+    return false;
+  }
+  hash_[source] = new_hash;
+  return true;
 }
 
-Status Config::getMD5(std::string& hash) {
+Status Config::genHash(std::string& hash) {
+  WriteLock lock(config_hash_mutex_);
   if (!valid_) {
     return Status(1, "Current config is not valid");
   }
 
-  ReadLock rlock(config_hash_mutex_);
   std::vector<char> buffer;
   buffer.reserve(hash_.size() * 32);
   auto add = [&buffer](const std::string& text) {
@@ -644,31 +851,34 @@ Status Config::getMD5(std::string& hash) {
   for (const auto& it : hash_) {
     add(it.second);
   }
+  hash = getBufferSHA1(buffer.data(), buffer.size());
 
-  hash = hashFromBuffer(HASH_TYPE_MD5, &buffer[0], buffer.size());
   return Status(0, "OK");
+}
+
+std::string Config::getHash(const std::string& source) const {
+  WriteLock lock(config_hash_mutex_);
+  if (!hash_.count(source)) {
+    return std::string();
+  }
+  return hash_.at(source);
 }
 
 const std::shared_ptr<ConfigParserPlugin> Config::getParser(
     const std::string& parser) {
-  std::shared_ptr<ConfigParserPlugin> config_parser = nullptr;
-  try {
-    auto plugin = Registry::get("config_parser", parser);
-    config_parser = std::dynamic_pointer_cast<ConfigParserPlugin>(plugin);
-  } catch (const std::out_of_range& e) {
-    LOG(ERROR) << "Error getting config parser plugin " << parser << ": "
-               << e.what();
-  } catch (const std::bad_cast& e) {
-    LOG(ERROR) << "Error casting " << parser
-               << " as a ConfigParserPlugin: " << e.what();
+  if (!RegistryFactory::get().exists("config_parser", parser, true)) {
+    return nullptr;
   }
-  return config_parser;
+
+  auto plugin = RegistryFactory::get().plugin("config_parser", parser);
+  // This is an error, need to check for existence (and not nullptr).
+  return std::dynamic_pointer_cast<ConfigParserPlugin>(plugin);
 }
 
 void Config::files(
     std::function<void(const std::string& category,
                        const std::vector<std::string>& files)> predicate) {
-  ReadLock rlock(config_files_mutex_);
+  RecursiveLock lock(config_files_mutex_);
   for (const auto& it : files_) {
     for (const auto& category : it.second) {
       predicate(category.first, category.second);
@@ -705,8 +915,7 @@ Status ConfigPlugin::call(const PluginRequest& request,
     if (request.count("source") == 0 || request.count("data") == 0) {
       return Status(1, "Missing source or data");
     }
-    return Config::getInstance().update(
-        {{request.at("source"), request.at("data")}});
+    return Config::get().update({{request.at("source"), request.at("data")}});
   }
   return Status(1, "Config plugin action unknown: " + request.at("action"));
 }
@@ -716,5 +925,21 @@ Status ConfigParserPlugin::setUp() {
     data_.put(key, "");
   }
   return Status(0, "OK");
+}
+
+void ConfigRefreshRunner::start() {
+  while (!interrupted()) {
+    // Cool off and time wait the configured period.
+    // Apply this interruption initially as at t=0 the config was read.
+    pauseMilli(refresh_ * mod_);
+    // Since the pause occurs before the logic, we need to check for an
+    // interruption request.
+    if (interrupted()) {
+      return;
+    }
+
+    VLOG(1) << "Refreshing configuration state";
+    Config::get().refresh();
+  }
 }
 }

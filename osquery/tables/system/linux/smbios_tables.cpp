@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -26,6 +26,7 @@ namespace tables {
 #define kLinuxSMBIOSRawLength_ 0x10000
 
 const std::string kLinuxEFISystabPath = "/sys/firmware/efi/systab";
+const std::string kLinuxDMISysfsPath = "/sys/firmware/dmi/tables/DMI";
 
 void LinuxSMBIOSParser::readFromAddress(size_t address, size_t length) {
   auto status = osquery::readRawMem(address, length, (void**)&data_);
@@ -35,7 +36,7 @@ void LinuxSMBIOSParser::readFromAddress(size_t address, size_t length) {
 
   // Search for the SMBIOS/DMI tables magic header string.
   size_t offset;
-  for (offset = 0; offset <= 0xFFF0; offset += 16) {
+  for (offset = 0; offset <= (length - sizeof(DMIEntryPoint)); offset += 16) {
     // Could look for "_SM_" for the SMBIOS header, but the DMI header exists
     // in both SMBIOS and the legacy DMI spec.
     if (memcmp(data_ + offset, "_DMI_", 5) == 0) {
@@ -59,10 +60,27 @@ void LinuxSMBIOSParser::readFromSystab(const std::string& systab) {
       if (details.size() == 2 && details[1].size() > 2) {
         long long int address;
         safeStrtoll(details[1], 16, address);
-        readFromAddress(address, kLinuxSMBIOSRawLength_);
+
+        // Be sure not to read past the 0x000F0000 - 0x00100000 range.
+        // Otherwise strict /dev/mem access will generate a log line.
+        size_t size = 0x100;
+        if (address < 0x100000 && (address + size) > 0x100000) {
+          // If the address is within the 1M strict /dev/mem boundary, and is
+          // within 226 bytes of that boundary, reduce the read size.
+          size = 0x100000 - address;
+        }
+        readFromAddress(address, size);
       }
     }
   }
+}
+
+void LinuxSMBIOSParser::readFromSysfs(const std::string& sysfs_dmi) {
+  std::string content;
+  readFile(sysfs_dmi, content);
+  table_data_ = (uint8_t*)malloc(content.size());
+  memcpy(table_data_, content.data(), content.size());
+  table_size_ = content.size();
 }
 
 bool LinuxSMBIOSParser::discoverTables(size_t address, size_t length) {
@@ -80,7 +98,11 @@ bool LinuxSMBIOSParser::discoverTables(size_t address, size_t length) {
 }
 
 bool LinuxSMBIOSParser::discover() {
-  if (osquery::isReadable(kLinuxEFISystabPath)) {
+  if (osquery::isReadable(kLinuxDMISysfsPath)) {
+    VLOG(1) << "Reading SMBIOS from sysfs DMI node";
+    readFromSysfs(kLinuxDMISysfsPath);
+  } else if (osquery::isReadable(kLinuxEFISystabPath)) {
+    VLOG(1) << "Reading SMBIOS from EFI provided memory location";
     readFromSystab(kLinuxEFISystabPath);
   } else {
     readFromAddress(kLinuxSMBIOSRawAddress_, kLinuxSMBIOSRawLength_);

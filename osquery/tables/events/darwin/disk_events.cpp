@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -9,9 +9,9 @@
  */
 
 #include <osquery/core.h>
+#include <osquery/events.h>
 #include <osquery/logger.h>
 #include <osquery/tables.h>
-#include <osquery/events.h>
 
 #include "osquery/events/darwin/diskarbitration.h"
 
@@ -41,7 +41,7 @@ Status DiskEventSubscriber::Callback(const ECRef& ec, const SCRef& sc) {
   r["action"] = ec->action;
   r["path"] = ec->path;
   r["name"] = ec->name;
-  r["bsd_name"] = "/dev/" + ec->bsd_name;
+  r["device"] = ec->device;
   r["uuid"] = ec->uuid;
   r["size"] = ec->size;
   r["ejectable"] = ec->ejectable;
@@ -53,12 +53,13 @@ Status DiskEventSubscriber::Callback(const ECRef& ec, const SCRef& sc) {
   r["filesystem"] = ec->filesystem;
   r["checksum"] = ec->checksum;
 
-  EventTime time = ec->time;
+  EventTime et = ec->time;
   if (ec->action == "add") {
-    boost::conversion::try_lexical_convert(ec->disk_appearance_time, time);
+    // Disk appearance time may be used in the future.
+    boost::conversion::try_lexical_convert(ec->disk_appearance_time, et);
   }
 
-  add(r, ec->time);
+  add(r);
   return Status(0, "OK");
 }
 }

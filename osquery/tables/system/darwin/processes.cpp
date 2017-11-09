@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,9 +8,6 @@
  *
  */
 
-#include <map>
-#include <set>
-
 #include <libproc.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -18,8 +15,11 @@
 
 #include <mach-o/dyld_images.h>
 
+#include <array>
+#include <map>
+#include <set>
+
 #include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/trim.hpp>
 
 #include <osquery/core.h>
 #include <osquery/filesystem.h>
@@ -31,17 +31,39 @@ namespace fs = boost::filesystem;
 namespace osquery {
 namespace tables {
 
+extern long getUptime();
+
 // The maximum number of expected memory regions per process.
 #define MAX_MEMORY_MAPS 512
 
 #define CPU_TIME_RATIO 1000000
 #define START_TIME_RATIO 1000000000
+#define NSECS_IN_USEC 1000
 
-std::set<int> getProcList(const QueryContext &context) {
+// Process states are as defined in sys/proc.h
+// SIDL   (1) Process being created by fork
+// SRUN   (2) Currently runnable
+// SSLEEP (3) Sleeping on an address
+// SSTOP  (4) Process debugging or suspension
+// SZOMB  (5) Awaiting collection by parent
+const char kProcessStateMapping[] = {' ', 'I', 'R', 'S', 'T', 'Z'};
+
+/**
+ * @brief Use process APIs for quick process path access.
+ *
+ * This has a secondary effect if the process is run as root. It can inspect
+ * the process memory for the first region to find the EXE path. This helps
+ * if the process's program was deleted.
+ *
+ * @param pid The pid requested.
+ */
+static std::string getProcPath(int pid);
+
+std::set<int> getProcList(const QueryContext& context) {
   std::set<int> pidlist;
   if (context.constraints.count("pid") > 0 &&
       context.constraints.at("pid").exists(EQUALS)) {
-    for (const auto &pid : context.constraints.at("pid").getAll<int>(EQUALS)) {
+    for (const auto& pid : context.constraints.at("pid").getAll<int>(EQUALS)) {
       if (pid > 0) {
         pidlist.insert(pid);
       }
@@ -55,58 +77,43 @@ std::set<int> getProcList(const QueryContext &context) {
     return pidlist;
   }
 
-  // arbitrarily create a list with 2x capacity in case more processes have
-  // been loaded since the last proc_listpids was executed
-  pid_t pids[2 * bufsize / sizeof(pid_t)];
+  // Use twice the number of PIDs returned to handle races.
+  std::vector<pid_t> pids(2 * bufsize);
 
-  // now that we've allocated "pids", let's overwrite num_pids with the actual
-  // amount of data that was returned for proc_listpids when we populate the
-  // pids data structure
-  bufsize = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids));
+  bufsize = proc_listpids(PROC_ALL_PIDS, 0, pids.data(), 2 * bufsize);
   if (bufsize <= 0) {
     VLOG(1) << "An error occurred retrieving the process list";
     return pidlist;
   }
 
-  int num_pids = bufsize / sizeof(pid_t);
-  for (int i = 0; i < num_pids; ++i) {
-    // if the pid is negative or 0, it doesn't represent a real process so
+  size_t num_pids = bufsize / sizeof(pid_t);
+  for (size_t i = 0; i < num_pids; ++i) {
+    // If the pid is negative or 0, it doesn't represent a real process so
     // continue the iterations so that we don't add it to the results set
     if (pids[i] <= 0) {
       continue;
     }
     pidlist.insert(pids[i]);
   }
-
   return pidlist;
-}
-
-inline std::string getProcPath(int pid) {
-  char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-  int bufsize = proc_pidpath(pid, path, sizeof(path));
-  if (bufsize <= 0) {
-    path[0] = '\0';
-  }
-
-  return std::string(path);
 }
 
 struct proc_cred {
   uint32_t parent{0};
   uint32_t group{0};
   uint32_t status{0};
-  uint32_t nice{0};
+  int32_t nice{0};
   struct {
     uid_t uid{0};
     gid_t gid{0};
   } real, effective, saved;
 };
 
-inline bool getProcCred(int pid, proc_cred &cred) {
+inline bool getProcCred(int pid, proc_cred& cred) {
   struct proc_bsdinfo bsdinfo;
   struct proc_bsdshortinfo bsdinfo_short;
 
-  if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdinfo, PROC_PIDTBSDINFO_SIZE) ==
+  if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 1, &bsdinfo, PROC_PIDTBSDINFO_SIZE) ==
       PROC_PIDTBSDINFO_SIZE) {
     cred.parent = bsdinfo.pbi_ppid;
     cred.group = bsdinfo.pbi_pgid;
@@ -121,7 +128,7 @@ inline bool getProcCred(int pid, proc_cred &cred) {
     return true;
   } else if (proc_pidinfo(pid,
                           PROC_PIDT_SHORTBSDINFO,
-                          0,
+                          1,
                           &bsdinfo_short,
                           PROC_PIDT_SHORTBSDINFO_SIZE) ==
              PROC_PIDT_SHORTBSDINFO_SIZE) {
@@ -140,21 +147,21 @@ inline bool getProcCred(int pid, proc_cred &cred) {
 }
 
 // Get the max args space
-static int genMaxArgs() {
+static inline int genMaxArgs() {
   static int argmax = 0;
 
   if (argmax == 0) {
     int mib[2] = {CTL_KERN, KERN_ARGMAX};
     size_t size = sizeof(argmax);
     if (sysctl(mib, 2, &argmax, &size, nullptr, 0) == -1) {
-      VLOG(1) << "An error occurred retrieving the max arg size";
+      VLOG(1) << "An error occurred retrieving the max argument size";
       return 0;
     }
   }
   return argmax;
 }
 
-void genProcRootAndCWD(int pid, Row &r) {
+void genProcRootAndCWD(int pid, Row& r) {
   r["cwd"] = "";
   r["root"] = "";
 
@@ -179,22 +186,19 @@ struct proc_args {
 
 proc_args getProcRawArgs(int pid, size_t argmax) {
   proc_args args;
-  uid_t euid = geteuid();
-  char procargs[argmax];
+  std::vector<char> procargs(argmax);
   int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
-  if (sysctl(mib, 3, &procargs, &argmax, nullptr, 0) == -1 || argmax == 0) {
-    if (euid == 0) {
-      TLOG << "An error occurred retrieving the env for pid: " << pid;
-    }
+  if (sysctl(mib, 3, procargs.data(), &argmax, nullptr, 0) == -1 ||
+      argmax == 0) {
     return args;
   }
 
   // The number of arguments is an integer in front of the result buffer.
   int nargs = 0;
-  memcpy(&nargs, procargs, sizeof(nargs));
+  memcpy(&nargs, procargs.data(), sizeof(nargs));
   // Walk the \0-tokenized list of arguments until reaching the returned 'max'
   // number of arguments or the number appended to the front.
-  const char *current_arg = &procargs[0] + sizeof(nargs);
+  const char* current_arg = &procargs[0] + sizeof(nargs);
   // Then skip the exec/program name.
   auto exec_name = std::string(current_arg);
   current_arg += exec_name.size() + 1;
@@ -220,11 +224,29 @@ proc_args getProcRawArgs(int pid, size_t argmax) {
     }
     current_arg += string_arg.size() + 1;
   }
-
   return args;
 }
 
-QueryData genProcesses(QueryContext &context) {
+static inline long getUptimeInUSec() {
+  struct timeval boot_time;
+  size_t len = sizeof(boot_time);
+  int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+
+  if (sysctl(mib, 2, &boot_time, &len, nullptr, 0) < 0) {
+    return -1;
+  }
+
+  time_t seconds_since_boot = boot_time.tv_sec;
+
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+
+  // Ignoring boot_time.tv_usec
+  return long(difftime(tv.tv_sec, seconds_since_boot) * CPU_TIME_RATIO +
+              tv.tv_usec);
+}
+
+QueryData genProcesses(QueryContext& context) {
   QueryData results;
 
   // Initialize time conversions.
@@ -236,12 +258,9 @@ QueryData genProcesses(QueryContext &context) {
   auto pidlist = getProcList(context);
   int argmax = genMaxArgs();
 
-  for (auto &pid : pidlist) {
+  for (auto& pid : pidlist) {
     Row r;
     r["pid"] = INTEGER(pid);
-    r["path"] = getProcPath(pid);
-    // OS X proc_name only returns 16 bytes, use the basename of the path.
-    r["name"] = fs::path(r["path"]).filename().string();
 
     {
       // The command line invocation including arguments.
@@ -256,9 +275,11 @@ QueryData genProcesses(QueryContext &context) {
     proc_cred cred;
     if (getProcCred(pid, cred)) {
       r["parent"] = BIGINT(cred.parent);
-      r["group"] = BIGINT(cred.group);
-      // Use Linux diction for process status/state.
-      r["state"] = INTEGER(cred.status);
+      r["pgroup"] = BIGINT(cred.group);
+      // check if process state is one of the expected ones
+      r["state"] = (1 <= cred.status && cred.status <= 5)
+                       ? TEXT(kProcessStateMapping[cred.status])
+                       : TEXT('?');
       r["nice"] = INTEGER(cred.nice);
       r["uid"] = BIGINT(cred.real.uid);
       r["gid"] = BIGINT(cred.real.gid);
@@ -267,16 +288,19 @@ QueryData genProcesses(QueryContext &context) {
       r["suid"] = BIGINT(cred.saved.uid);
       r["sgid"] = BIGINT(cred.saved.gid);
     } else {
-      r["parent"] = "0";
-      r["group"] = "0";
-      r["state"] = "0";
-      r["nice"] = "0";
-      r["uid"] = "-1";
-      r["gid"] = "-1";
-      r["euid"] = "-1";
-      r["egid"] = "-1";
-      r["suid"] = "-1";
-      r["sgid"] = "-1";
+      continue;
+    }
+
+    // If the process is not a Zombie, try to find the path and name.
+    if (cred.status != 5) {
+      r["path"] = getProcPath(pid);
+      // OS X proc_name only returns 16 bytes, use the basename of the path.
+      r["name"] = fs::path(r["path"]).filename().string();
+    } else {
+      r["path"] = "";
+      std::vector<char> name(17);
+      proc_name(pid, name.data(), 16);
+      r["name"] = std::string(name.data());
     }
 
     // If the path of the executable that started the process is available and
@@ -284,34 +308,61 @@ QueryData genProcesses(QueryContext &context) {
     // available, set on_disk to -1. If, and only if, the path of the
     // executable is available and the file does NOT exist on disk, set on_disk
     // to 0.
-    r["on_disk"] = osquery::pathExists(r["path"]).toString();
+    if (r["path"].empty()) {
+      r["on_disk"] = INTEGER(-1);
+    } else if (pathExists(r["path"])) {
+      r["on_disk"] = INTEGER(1);
+    } else {
+      r["on_disk"] = INTEGER(0);
+    }
 
     // systems usage and time information
     struct rusage_info_v2 rusage_info_data;
-    int rusage_status = proc_pid_rusage(
-        pid, RUSAGE_INFO_V2, (rusage_info_t *)&rusage_info_data);
+    int status =
+        proc_pid_rusage(pid, RUSAGE_INFO_V2, (rusage_info_t*)&rusage_info_data);
     // proc_pid_rusage returns -1 if it was unable to gather information
-    if (rusage_status == 0) {
+    if (status == 0) {
       // size/memory information
       r["wired_size"] = TEXT(rusage_info_data.ri_wired_size);
       r["resident_size"] = TEXT(rusage_info_data.ri_resident_size);
-      r["phys_footprint"] = TEXT(rusage_info_data.ri_phys_footprint);
+      r["total_size"] = TEXT(rusage_info_data.ri_phys_footprint);
 
       // time information
       r["user_time"] = TEXT(rusage_info_data.ri_user_time / CPU_TIME_RATIO);
       r["system_time"] = TEXT(rusage_info_data.ri_system_time / CPU_TIME_RATIO);
-      // Convert the time in CPU ticks since boot to seconds.
-      // This is relative to time not-sleeping since boot.
-      r["start_time"] =
-          TEXT((rusage_info_data.ri_proc_start_abstime / START_TIME_RATIO) *
-               time_base.numer / time_base.denom);
+
+      // Below is the logic to caculate the start_time since boot time
+      // with higher precision
+      auto uptime = getUptimeInUSec();
+      uint64_t absoluteTime = mach_absolute_time();
+
+      auto multiply = static_cast<double>(time_base.numer) /
+                      static_cast<double>(time_base.denom);
+      auto diff = static_cast<long>(
+          (rusage_info_data.ri_proc_start_abstime - absoluteTime));
+
+      // This is a negative value
+      auto seconds_since_launch =
+          static_cast<long>(diff * multiply) / NSECS_IN_USEC;
+
+      // Get the start_time of process since the computer started
+      r["start_time"] = TEXT((uptime + seconds_since_launch) / CPU_TIME_RATIO);
     } else {
       r["wired_size"] = "-1";
       r["resident_size"] = "-1";
-      r["phys_footprint"] = "-1";
+      r["total_size"] = "-1";
       r["user_time"] = "-1";
       r["system_time"] = "-1";
       r["start_time"] = "-1";
+    }
+
+    struct proc_taskinfo task_info;
+    status =
+        proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &task_info, sizeof(task_info));
+    if (status == sizeof(task_info)) {
+      r["threads"] = INTEGER(task_info.pti_threadnum);
+    } else {
+      r["threads"] = "-1";
     }
 
     results.push_back(r);
@@ -320,14 +371,14 @@ QueryData genProcesses(QueryContext &context) {
   return results;
 }
 
-QueryData genProcessEnvs(QueryContext &context) {
+QueryData genProcessEnvs(QueryContext& context) {
   QueryData results;
 
   auto pidlist = getProcList(context);
   int argmax = genMaxArgs();
-  for (const auto &pid : pidlist) {
+  for (const auto& pid : pidlist) {
     auto args = getProcRawArgs(pid, argmax);
-    for (const auto &env : args.env) {
+    for (const auto& env : args.env) {
       Row r;
       r["pid"] = INTEGER(pid);
       r["key"] = env.first;
@@ -340,11 +391,11 @@ QueryData genProcessEnvs(QueryContext &context) {
 }
 
 void genMemoryRegion(int pid,
-                     const vm_address_t &address,
-                     const vm_size_t &size,
-                     struct vm_region_submap_info_64 &info,
-                     const std::map<vm_address_t, std::string> &libraries,
-                     QueryData &results) {
+                     const vm_address_t& address,
+                     const vm_size_t& size,
+                     struct vm_region_submap_info_64& info,
+                     const std::map<vm_address_t, std::string>& libraries,
+                     QueryData& results) {
   Row r;
   r["pid"] = INTEGER(pid);
 
@@ -417,7 +468,7 @@ void genMemoryRegion(int pid,
 
   // Submaps or offsets into regions may contain libraries mapped from the
   // dyld cache.
-  for (const auto &library : libraries) {
+  for (const auto& library : libraries) {
     if (library.first > address && library.first < (address + size)) {
       r["offset"] = INTEGER(info.offset + (library.first - address));
       r["path"] = library.second;
@@ -427,9 +478,9 @@ void genMemoryRegion(int pid,
   }
 }
 
-static bool readProcessMemory(const mach_port_t &task,
-                              const vm_address_t &from,
-                              const vm_size_t &size,
+static bool readProcessMemory(const mach_port_t& task,
+                              const vm_address_t& from,
+                              const vm_size_t& size,
                               vm_address_t to) {
   vm_size_t bytes;
   auto status = vm_read_overwrite(task, from, size, to, &bytes);
@@ -443,8 +494,8 @@ static bool readProcessMemory(const mach_port_t &task,
   return true;
 }
 
-void genProcessLibraries(const mach_port_t &task,
-                         std::map<vm_address_t, std::string> &libraries) {
+void genProcessLibraries(const mach_port_t& task,
+                         std::map<vm_address_t, std::string>& libraries) {
   struct task_dyld_info dyld_info;
   mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
   auto status =
@@ -455,7 +506,7 @@ void genProcessLibraries(const mach_port_t &task,
   }
 
   // The info struct is a pointer to another process's virtual space.
-  auto all_info = (struct dyld_all_image_infos *)dyld_info.all_image_info_addr;
+  auto all_info = (struct dyld_all_image_infos*)dyld_info.all_image_info_addr;
   uint64_t image_offset = (uint64_t)all_info;
   if (dyld_info.all_image_info_format != TASK_DYLD_ALL_IMAGE_INFO_64) {
     // Only support 64bit process images.
@@ -508,7 +559,7 @@ void genProcessLibraries(const mach_port_t &task,
   }
 }
 
-void genProcessMemoryMap(int pid, QueryData &results) {
+void genProcessMemoryMap(int pid, QueryData& results, bool exe_only = false) {
   mach_port_t task = MACH_PORT_NULL;
   kern_return_t status = task_for_pid(mach_task_self(), pid, &task);
   if (status != KERN_SUCCESS) {
@@ -518,7 +569,9 @@ void genProcessMemoryMap(int pid, QueryData &results) {
 
   // Create a map of library paths from the dyld cache.
   std::map<vm_address_t, std::string> libraries;
-  genProcessLibraries(task, libraries);
+  if (!exe_only) {
+    genProcessLibraries(task, libraries);
+  }
 
   // Use address offset (starting at 0) to count memory maps.
   vm_address_t address = 0;
@@ -546,6 +599,9 @@ void genProcessMemoryMap(int pid, QueryData &results) {
     }
 
     genMemoryRegion(pid, address, size, info, libraries, results);
+    if (exe_only) {
+      break;
+    }
     address += size;
   }
 
@@ -554,11 +610,28 @@ void genProcessMemoryMap(int pid, QueryData &results) {
   }
 }
 
+static std::string getProcPath(int pid) {
+  char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+  int bufsize = proc_pidpath(pid, path, sizeof(path));
+  if (bufsize <= 0) {
+    if (getuid() == 0) {
+      QueryData memory_map;
+      genProcessMemoryMap(pid, memory_map, true);
+      if (memory_map.size() > 0) {
+        return memory_map[0]["path"];
+      }
+    }
+    path[0] = '\0';
+  }
+
+  return std::string(path);
+}
+
 QueryData genProcessMemoryMap(QueryContext& context) {
   QueryData results;
 
   auto pidlist = getProcList(context);
-  for (const auto &pid : pidlist) {
+  for (const auto& pid : pidlist) {
     genProcessMemoryMap(pid, results);
   }
 

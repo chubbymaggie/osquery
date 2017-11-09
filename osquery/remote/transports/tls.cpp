@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,34 +8,17 @@
  *
  */
 
+// clang-format off
+// This must be here to prevent a WinSock.h exists error
 #include "osquery/remote/transports/tls.h"
+// clang-format on
 
-#include <boost/asio/ssl/context_base.hpp>
+#include <boost/filesystem.hpp>
 
+#include <osquery/core.h>
 #include <osquery/filesystem.h>
 
-namespace http = boost::network::http;
-
-/// Apple's 0.9.8 OpenSSL will lack TLS protocols.
-extern "C" {
-#if !defined(HAS_SSL_TXT_TLSV1_1) and !defined(HAS_SSL_TXT_TLSV1_2)
-SSL_CTX* TLSv1_1_client_method(void) { return nullptr; }
-SSL_CTX* TLSv1_1_method(void) { return nullptr; }
-SSL_CTX* TLSv1_1_server_method(void) { return nullptr; }
-#endif
-#if !defined(HAS_SSL_TXT_TLSV1_2)
-struct CRYPTO_THREADID;
-void ERR_remove_thread_state(const CRYPTO_THREADID* tid) {}
-SSL_CTX* TLSv1_2_client_method(void) { return nullptr; }
-SSL_CTX* TLSv1_2_method(void) { return nullptr; }
-SSL_CTX* TLSv1_2_server_method(void) { return nullptr; }
-#endif
-#if defined(NO_SSL_TXT_SSLV3)
-SSL_METHOD* SSLv3_server_method(void) { return nullptr; }
-SSL_METHOD* SSLv3_client_method(void) { return nullptr; }
-SSL_METHOD* SSLv3_method(void) { return nullptr; }
-#endif
-}
+namespace fs = boost::filesystem;
 
 namespace osquery {
 
@@ -50,10 +33,13 @@ CLI_FLAG(string,
          "",
          "TLS/HTTPS hostname for Config, Logger, and Enroll plugins");
 
+/// Optional HTTP proxy server hostname.
+CLI_FLAG(string, proxy_hostname, "", "Optional HTTP proxy hostname");
+
 /// Path to optional TLS server/CA certificate(s), used for pinning.
 CLI_FLAG(string,
          tls_server_certs,
-         "",
+         OSQUERY_CERTS_HOME "certs.pem",
          "Optional path to a TLS server PEM certificate(s) bundle");
 
 /// Path to optional TLS client certificate, used for enrollment/requests.
@@ -93,24 +79,25 @@ TLSTransport::TLSTransport() : verify_peer_(true) {
   }
 }
 
-void TLSTransport::decorateRequest(http::client::request& r) {
-  r << boost::network::header("Connection", "close");
-  r << boost::network::header("Content-Type", serializer_->getContentType());
-  r << boost::network::header("Accept", serializer_->getContentType());
-  r << boost::network::header("Host", FLAGS_tls_hostname);
-  r << boost::network::header("User-Agent", kTLSUserAgentBase + kVersion);
+void TLSTransport::decorateRequest(http::Request& r) {
+  r << http::Request::Header("Content-Type", serializer_->getContentType());
+  r << http::Request::Header("Accept", serializer_->getContentType());
+  r << http::Request::Header("User-Agent", kTLSUserAgentBase + kVersion);
 }
 
-http::client TLSTransport::getClient() {
-  http::client::options options;
-  options.follow_redirects(true).always_verify_peer(verify_peer_).timeout(4);
+http::Client::Options TLSTransport::getOptions() {
+  http::Client::Options options;
+  options.follow_redirects(true).always_verify_peer(verify_peer_).timeout(16);
+
+  if (FLAGS_proxy_hostname.size() > 0) {
+    options.proxy_hostname(FLAGS_proxy_hostname);
+  }
 
   std::string ciphers = kTLSCiphers;
-// Some Ubuntu 12.04 clients exhaust their cipher suites without SHA.
-#if defined(HAS_SSL_TXT_TLSV1_2) && !defined(UBUNTU_PRECISE) && !defined(DARWIN)
-  // Otherwise we prefer GCM and SHA256+
-  ciphers += ":!CBC:!SHA";
-#endif
+  if (!isPlatform(PlatformType::TYPE_OSX)) {
+    // Otherwise we prefer GCM and SHA256+
+    ciphers += ":!CBC:!SHA";
+  }
 
 #if defined(DEBUG)
   // Configuration may allow unsafe TLS testing if compiled as a debug target.
@@ -128,26 +115,43 @@ http::client TLSTransport::getClient() {
                    << server_certificate_file_;
     } else {
       // There is a non-default server certificate set.
+      boost_system::error_code ec;
+
+      auto status = fs::status(server_certificate_file_, ec);
       options.openssl_verify_path(server_certificate_file_);
-      options.openssl_certificate(server_certificate_file_);
+
+      // On Windows, we cannot set openssl_certificate to a directory
+      if (isPlatform(PlatformType::TYPE_WINDOWS) &&
+          status.type() != fs::regular_file) {
+        LOG(WARNING) << "Cannot set a non-regular file as a certificate: "
+                     << server_certificate_file_;
+      } else {
+        options.openssl_certificate(server_certificate_file_);
+      }
     }
   }
 
   if (client_certificate_file_.size() > 0) {
     if (!osquery::isReadable(client_certificate_file_).ok()) {
-      LOG(WARNING)
-          << "Cannot read TLS client certificate: " << client_certificate_file_;
+      LOG(WARNING) << "Cannot read TLS client certificate: "
+                   << client_certificate_file_;
     } else if (!osquery::isReadable(client_private_key_file_).ok()) {
-      LOG(WARNING)
-          << "Cannot read TLS client private key: " << client_private_key_file_;
+      LOG(WARNING) << "Cannot read TLS client private key: "
+                   << client_private_key_file_;
     } else {
       options.openssl_certificate_file(client_certificate_file_);
       options.openssl_private_key_file(client_private_key_file_);
     }
   }
 
-  http::client client(options);
-  return client;
+  // 'Optionally', though all TLS plugins should set a hostname, supply an SNI
+  // hostname. This will reveal the requested domain.
+  if (options_.count("hostname")) {
+    // Boost cpp-netlib will only support SNI in versions >= 0.12
+    options.openssl_sni_hostname(options_.get<std::string>("hostname"));
+  }
+
+  return options;
 }
 
 inline bool tlsFailure(const std::string& what) {
@@ -162,16 +166,16 @@ Status TLSTransport::sendRequest() {
     return Status(1, "Cannot create TLS request for non-HTTPS protocol URI");
   }
 
-  auto client = getClient();
-  http::client::request r(destination_);
+  http::Client client(getOptions());
+  http::Request r(destination_);
   decorateRequest(r);
 
+  VLOG(1) << "TLS/HTTPS GET request to URI: " << destination_;
   try {
-    VLOG(1) << "TLS/HTTPS GET request to URI: " << destination_;
     response_ = client.get(r);
-    const auto& response_body = body(response_);
+    const auto& response_body = response_.body();
     if (FLAGS_verbose && FLAGS_tls_dump) {
-      fprintf(stdout, "%s\n", std::string(response_body).c_str());
+      fprintf(stdout, "%s\n", response_body.c_str());
     }
     response_status_ =
         serializer_->deserialize(response_body, response_params_);
@@ -182,36 +186,41 @@ Status TLSTransport::sendRequest() {
   return response_status_;
 }
 
-Status TLSTransport::sendRequest(const std::string& params) {
+Status TLSTransport::sendRequest(const std::string& params, bool compress) {
   if (destination_.find("https://") == std::string::npos) {
     return Status(1, "Cannot create TLS request for non-HTTPS protocol URI");
   }
 
-  auto client = getClient();
-  http::client::request r(destination_);
+  http::Client client(getOptions());
+  http::Request r(destination_);
   decorateRequest(r);
+  if (compress) {
+    // Later, when posting/putting, the data will be optionally compressed.
+    r << http::Request::Header("Content-Encoding", "gzip");
+  }
 
   // Allow request calls to override the default HTTP POST verb.
   HTTPVerb verb = HTTP_POST;
-  if (options_.count("verb") > 0) {
-    verb = (HTTPVerb)options_.get<int>("verb", HTTP_POST);
+  if (options_.count("_verb") > 0) {
+    verb = (HTTPVerb)options_.get<int>("_verb", HTTP_POST);
+  }
+
+  VLOG(1) << "TLS/HTTPS " << ((verb == HTTP_POST) ? "POST" : "PUT")
+          << " request to URI: " << destination_;
+  if (FLAGS_verbose && FLAGS_tls_dump) {
+    fprintf(stdout, "%s\n", params.c_str());
   }
 
   try {
-    VLOG(1) << "TLS/HTTPS " << ((verb == HTTP_POST) ? "POST" : "PUT")
-            << " request to URI: " << destination_;
-    if (FLAGS_verbose && FLAGS_tls_dump) {
-      fprintf(stdout, "%s\n", params.c_str());
-    }
     if (verb == HTTP_POST) {
-      response_ = client.post(r, params);
+      response_ = client.post(r, (compress) ? compressString(params) : params);
     } else {
-      response_ = client.put(r, params);
+      response_ = client.put(r, (compress) ? compressString(params) : params);
     }
 
-    const auto& response_body = body(response_);
+    const auto& response_body = response_.body();
     if (FLAGS_verbose && FLAGS_tls_dump) {
-      fprintf(stdout, "%s\n", std::string(response_body).c_str());
+      fprintf(stdout, "%s\n", response_body.c_str());
     }
     response_status_ =
         serializer_->deserialize(response_body, response_params_);

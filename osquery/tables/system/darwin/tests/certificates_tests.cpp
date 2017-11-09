@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,7 +13,7 @@
 #include <osquery/logger.h>
 
 #include "osquery/tables/system/darwin/keychain.h"
-#include "osquery/core/test_util.h"
+#include "osquery/tests/test_util.h"
 
 namespace osquery {
 namespace tables {
@@ -54,7 +54,7 @@ class CACertsTests : public ::testing::Test {
 
 TEST_F(CACertsTests, test_certificate_sha1) {
   std::string sha1;
-  sha1 = genSHA1ForCertificate(cert_der_data);
+  sha1 = genSHA1ForCertificate(x_cert);
 
   EXPECT_EQ("f149bae28e3c754ff4bb062b2c1b8bac81b8783e", sha1);
 }
@@ -64,7 +64,7 @@ TEST_F(CACertsTests, test_certificate_properties) {
   genCommonName(x_cert, subject, common_name, issuer);
   EXPECT_EQ("localhost.localdomain", common_name);
 
-  OSX_OPENSSL(X509_check_ca(x_cert));
+  X509_check_ca(x_cert);
   auto skid = genKIDProperty(x_cert->skid->data, x_cert->skid->length);
   EXPECT_EQ("f2b99b00e0ee60d57c426ce3e64e3fdc6f6411c0", skid);
 

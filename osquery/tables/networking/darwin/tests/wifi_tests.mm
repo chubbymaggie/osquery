@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,7 +12,7 @@
 #include <Foundation/Foundation.h>
 #include <gtest/gtest.h>
 
-#include "osquery/core/test_util.h"
+#include "osquery/tests/test_util.h"
 
 namespace osquery {
 namespace tables {
@@ -37,9 +37,9 @@ TEST_F(WifiNetworksTest, test_parse_wifi_networks) {
   QueryData results;
   auto count = CFDictionaryGetCount(networks);
   ASSERT_EQ((long)count, 2);
-  const void* keys[count];
-  const void* values[count];
-  CFDictionaryGetKeysAndValues(networks, keys, values);
+  std::vector<const void *> keys(count);
+  std::vector<const void *> values(count);
+  CFDictionaryGetKeysAndValues(networks, keys.data(), values.data());
 
   for (CFIndex i = 0; i < count; i++) {
     parseNetworks((CFDictionaryRef)values[i], results);

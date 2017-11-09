@@ -1,15 +1,9 @@
 An osquery deployment consists of:
 
-* Installing the tools for [OS X](../installation/install-osx.md) or
-	[Linux](../installation/install-linux.md)
+* Installing the tools for [Windows](../installation/install-windows.md), [macOS](../installation/install-osx.md), or [Linux](../installation/install-linux.md)
 * Reviewing the [osqueryd](../introduction/using-osqueryd.md) introduction
 * Configuring and starting the **osqueryd** service (this page)
 * Managing and [collecting](log-aggregation.md) the query results
-
-In the future, osquery tools may allow for **ad-hoc** or distributed queries
-that are not part of the configured query schedule and return results
-from several selected hosts. Currently, the **osqueryd** service only accepts
-a query schedule from a configuration.
 
 ## Configuration components
 
@@ -22,21 +16,22 @@ There are several components contributing to a configuration:
 
 * Daemon options and feature settings
 * Query Schedule: the set of SQL queries and intervals
-* File Change Monitoring: categories and paths of monitored files and
-	directories
+* File Change Monitoring: categories and paths of monitored files and directories
 * (insert new feature that requires a configuration here!)
 
-There are also "initialization" parameters that control how osqueryd is
+There are also "initialization" parameters that control how **osqueryd** is
 launched.  These parameters only make sense as command-line arguments since
 they are used before a configuration plugin is selected. See the [command line
 flags](../installation/cli-flags.md) overview for a complete list of these
 parameters.
 
 The default config plugin, **filesystem**, reads from a file and optional
-directory ".d" based on the filename.
+directory ".d" based on the filename. The included initscripts set the default
+config path as follows:
 
+* Windows: **C:\ProgramData\osquery\osquery.conf**
 * Linux: **/etc/osquery/osquery.conf** and **/etc/osquery/osquery.conf.d/**
-* Mac OS X: **/var/osquery/osquery.conf** and **/var/osquery/osquery.conf.d/**
+* MacOS: **/var/osquery/osquery.conf** and **/var/osquery/osquery.conf.d/**
 
 You may override the **filesystem** plugin's path using
 `--config_path=/path/to/osquery.conf`. You may also use the ".d/" directory
@@ -51,7 +46,7 @@ Here is an example config that includes options and the query schedule:
     "schedule_splay_percent": 10
   },
   "schedule": {
-    "macosx_kextstat": {
+    "macos_kextstat": {
       "query": "SELECT * FROM kernel_extensions;",
       "interval": 10
     },
@@ -63,40 +58,480 @@ Here is an example config that includes options and the query schedule:
 }
 ```
 
-This config tells osqueryd to schedule two queries, **macosx_kextstat** and
+This config tells osqueryd to schedule two queries, **macos_kextstat** and
 **foobar**:
 
 * the schedule keys must be unique
-* the "interval" specifies query frequency (in seconds)
+* the `interval` specifies query frequency (in seconds)
 
-The first query will document changes to the OS X host's kernel extensions,
+The first query will log changes to the macOS host's kernel extensions,
 with a query interval of 10 seconds. Consider using osquery's [performance
 tooling](performance-safety.md) to understand the performance impact for each
 query.
 
 The results of your query are cached on disk using
 [RocksDB](http://rocksdb.org/). On the first query run, all of the results are
-stored in RocksDB. On subsequent runs, only result-set changes are logged to
-RocksDB.
+stored in RocksDB. On subsequent runs, only result-set-difference (changes) are logged to RocksDB.
 
 Scheduled queries can also set: `"removed":false` and `"snapshot":true`. See
-the next section on [logging](logging.md) to learn how query options affect the
-output.
+the next section on [logging](../deployment/logging.md), and the below configuration specification to learn how query options affect the output.
+
+> NOTICE: that the `interval` time in seconds is how many seconds the _daemon_
+itself has been running before the scheduled query will be executed. If the
+system is suspended or put to sleep the progression of time "freezes" and
+resumes when the system comes back online. For example a scheduled query with
+an interval of `84600`, or 24 hours, running on a laptop system could take
+a few days before the query executes if the system is suspended at night.
+
+## Query Packs
+
+Configuration supports sets, called packs, of queries that help define your
+schedule. Packs are distributed with osquery and labeled based on broad
+categories of information and visibility. For example, a "compliance" pack will
+include queries that check for changes in locked down operating system features
+and user settings. A "vulnerability management" pack may perform general asset
+management queries that build event logs around package and software install
+changes.
+
+In an osquery configuration JSON, packs are defined as a top-level-key and
+consist of pack name to pack content JSON data structures.
+
+```json
+{
+  "schedule": {...},
+  "packs": {
+    "internal_stuff": {
+      "discovery": [
+        "SELECT pid FROM processes WHERE name = 'ldap';"
+      ],
+      "platform": "linux",
+      "version": "1.5.2",
+      "queries": {
+        "active_directory": {
+          "query": "SELECT * FROM ad_config;",
+          "interval": "1200",
+          "description": "Check each user's active directory cached settings."
+        }
+      }
+    },
+    "testing": {
+      "shard": "10",
+      "queries": {
+        "suid_bins": {
+          "query": "SELECT * FROM suid_bins;",
+          "interval": "3600"
+        }
+      }
+    }
+  }
+}
+```
+
+The pack value may also be a string, such as:
+
+```json
+{
+  "packs": {
+    "external_pack": "/path/to/external_pack.conf",
+    "internal_stuff": {
+      [...]
+    }
+  }
+}
+```
+
+If using a string instead of an inline JSON dictionary the configuration plugin will be asked to "generate" that resource. In the case of the default **filesystem** plugin, these strings are considered paths.
+
+The **filesystem** plugin supports another convention for adding a directory of packs:
+```json
+{
+  "packs": {
+    "*": "/path/to/*",
+  }
+}
+```
+
+Here the name `*` asks the plugin to *glob* the value and construct a multi-pack. The name of each pack will correspond to the filename *leaf* without the final extension, e.g. `/path/to/external_pack.conf` will be named `external_pack`.
+
+Queries added to the schedule from packs inherit the pack name as part of the scheduled query name identifier. For example, consider the embedded `active_directory` query above, it is in the `internal_stuff` pack so the scheduled query name becomes: `pack_internal_stuff_active_directory`. The delimiter can be changed using the `--pack_delimiter=_`, see the [CLI Options](../installation/cli-flags.md) for more details.
+
+### Discovery queries
+
+Discovery queries are a feature of query packs that make it much easier to monitor services at scale. Consider that there are some groups of scheduled
+queries which should only be run on a host when a condition is true. For
+example, perhaps you want to write some queries to monitor MySQL. You've made a
+pack called "mysql" and now you only want the queries in that pack to execute
+if the `mysqld` program is running on the host.
+
+Without discovery queries, you could have your configuration management write a
+different configuration file for your MySQL tier. Unfortunately, however, this
+requires you to know the complete set of hosts in your environment which are
+running MySQL. This is problematic, especially if engineers in your environment
+can install arbitrary software on arbitrary hosts. If MySQL is installed on a
+non-standard host, you have no way to know. Therefore, you cannot schedule your MySQL pack on those hosts through configuration management logic.
+
+One solution to this problem is discovery queries.
+
+Query packs allow you to define a set of osquery queries which control whether
+or not the pack will execute. Discovery queries are represented by the
+top-level "discovery" key-word in a pack. The value should be a list of osquery
+queries. If all of the queries return more than zero rows, then the queries are
+added to the query schedule. This allows you to distribute configurations for
+many services and programs, while ensuring that only relevant queries will be
+executing on your host.
+
+You don't need to define any discovery queries for a pack. If no discovery
+queries are defined, then the pack will always execute.
+
+Discovery queries look like:
+
+```json
+{
+  "discovery": [
+    "SELECT pid FROM processes WHERE name = 'foobar';",
+    "SELECT count(*) FROM users WHERE username like 'www%';"
+  ],
+  "queries": {}
+}
+```
+
+In the above example, the pack will only execute on hosts which are running
+processes called "foobar" or has users that start with "www".
+
+Discovery queries are refreshed for all packs every 60 minutes. You can
+change this value via the `pack_refresh_interval` configuration option.
+
+### Packs FAQs
+
+**Where do packs go?**
+
+The default way to define a query pack is in the main configuration file.
+Consider the following example:
+
+```json
+{
+  "options": {
+    "enable_monitor": "true"
+  },
+  "packs": {
+    "foo": {
+      "queries": {}
+    },
+    "bar": {
+      "queries": {}
+    }
+  }
+}
+```
+
+Alternatively, however, you can also define the value of a pack as a raw
+string. Consider the following example:
+
+```json
+{
+  "options": {
+    "enable_monitor": "true"
+  },
+  "packs": {
+    "foo": "/tmp/foo.json",
+    "bar": "/tmp/bar.json"
+  }
+}
+```
+
+In the above example, the packs are defined using a local filesystem path.
+When osquery's config parser is provided a string instead of inline dictionary the active config plugin is called to resolve what should be done to go from `/tmp/foo.json` to the actual content of the pack. See [configuration plugin](../development/config-plugins.md) development for more information on packs.
+
+**Where can I get more packs?**
+
+We release (and bundle alongside RPMs/DEBs/PKGs/etc.) query packs that emit high signal events as well as event data that is worth storing in the case of future incidents and security events. The queries within each pack will be performance tested and well-formed (JOIN, select-limited, etc.). But it is always an exercise for the user to make sure queries are useful and are not impacting performance critical hosts. You can find the query packs that are released by the osquery team documented at [https://osquery.io/docs/packs](https://osquery.io/docs/packs) and the content in [**/packs**](https://github.com/facebook/osquery/blob/master/packs) within the osquery repository.
+
+**How do I modify the default options in the provided packs?**
+
+We don't offer a built-in way to modify the default intervals / options in the
+supplied query packs. Fortunately, however, packs are just JSON. Therefore, it
+would be rather trivial to write a tool which reads in pack JSON, modifies it
+in some way, then re-writes the JSON.
+
+## Configuration specification
+
+This section details all (read: most) of the default configuration keys, called the default specification. We mention 'default' as the configuration can be extended using `ConfigParser` plugins.
+
+### Options
+
+The `options` key defines a map of option name to option value pairs. The names must be a CLI flag in the "osquery configuration options" set; running `osqueryd --help` will enumerate the list.
+
+Example:
+```json
+{
+  "options": {
+    "read_max": 100000,
+    "events_max": 100000,
+    "enable_monitor": true,
+    "host_identifier": "uuid"
+  }
+}
+```
+
+If a flag value is specified on the CLI as a switch, or specified in the Gflags `--flagfile` file it will be overridden if the equivalent "options" key exists in the config.
+
+There are LOTs of CLI flags that CANNOT be set with the `options` key. These flags determine the start and initialization of osquery and configuration loading usually depends on these CLI-only flags. Refer to the `--help` list to determine the appropriateness of options.
+
+It is possible to set "custom" options that do not exist as flags. These will not do anything without adding appropriate code. Options using the prefix `custom_` can be accessed via `osquery::Flag::updateValue("custom_NAME", value)` and `osquery::Flag::getValue("custom_NAME");`.
+
+### Schedule
+
+The `schedule` key defines a map of scheduled query names to the query details. You will see mention of the schedule throughout osquery's documentation. It is the focal point of osqueryd's capabilities.
+
+Example:
+```json
+{
+  "schedule": {
+    "users_browser_plugins": {
+      "query": "SELECT * FROM users JOIN browser_plugins USING (uid);",
+      "interval": 60
+    },
+    "hashes_of_bin": {
+      "query": "SELECT path, hash.sha256 FROM file JOIN hash USING (path) WHERE file.directory = '/bin/';",
+      "interval": 3600,
+      "removed": false,
+      "platform": "darwin",
+      "version": "1.4.5",
+      "shard": 1
+    }
+  }
+}
+```
+
+Each of `schedule`'s value's is also a map, we call these scheduled queries and their key is the `name` which shows up in your results log. In the example above the schedule includes two queries: **users_browser_plugins** and **hashes_of_bin**. While it is common to schedule a `SELECT * FROM your_favorite_table`, one of the powers of osquery is SQL expression and the combination of several table concepts please use `JOIN`s liberally.
+
+The basic scheduled query specification includes:
+* `query`: the SQL query to run
+* `interval`: an interval in seconds to run the query (subject to splay/smoothing)
+* `removed`: a boolean to determine if removed actions should be logged
+* `snapshot`: a boolean to set 'snapshot' mode
+* `platform`: restrict this query to a given platform
+* `version`: only run on osquery versions greater than or equal-to
+* `shard`: restrict this query to a percentage (1-100) of target hosts
+
+The `platform` key can be:
+* `darwin` for MacOS hosts
+* `freebsd` for FreeBSD hosts
+* `linux` for any RedHat or Debian-based hosts
+* `posix` for `linux`, `freebsd`, and `linux` hosts
+* `windows` for any Windows desktop or server hosts
+* `any` or `all` for all, alternatively no platform key selects all
+
+The `shard` key works by hashing the hostname then taking the quotient 255 of the first byte. This allows us to select a deterministic 'preview' for the query, this helps when slow-rolling or testing new queries.
+
+The schedule and associated queries generate a timeline of events through the defined intervals. There are several tables `*_events` which natively yield a time series, all other tables are subjected to execution on an interval. When the results from a table differ from the results when the query was last executed, logs are emitted with `{"action": "removed"}` or `{"action": "added"}` for the appropriate action.
+
+Snapshot queries, those with `snapshot: true` will not store differentials and will not emulate an event stream. Snapshots always return the entire results from the query on the given interval. See
+the next section on [logging](../deployment/logging.md) for examples of each log output.
+
+### Packs
+
+The above section on packs almost covers all you need to know about query packs. The specification contains a few caveats since packs are designed for distribution. Packs use the `packs` key, a map where the key is a pack name and the value can be either a string or a dictionary (object). When a string is used the value is passed back into the config plugin and acts as a "resource" request.
+
+```json
+{
+  "packs": {
+    "pack_name_1": "/path/to/pack.json",
+    "pack_name_2": {
+      "queries": {},
+      "shard": 10,
+      "version": "1.7.0",
+      "platform": "linux",
+      "discovery": [
+        "SELECT * FROM processes WHERE name = 'osqueryi';"
+      ]
+    }
+  }
+}
+```
+
+As with scheduled queries, described above, each pack borrows the `platform`, `version`, and `shard` selectors and restrictions. These work the exact same way, but apply to the entire pack. This is a short-hand for applying selectors and restrictions to large sets of queries.
+
+The `queries` key mimics the configuration's `schedule` key.
+
+The `discovery` query set feature is described in detail in the above packs section. This array should include queries to be executed in an `OR` manner.
+
+### File Paths
+
+The `file_paths` key defines a map of file integrity monitoring (FIM) categories to sets of filesystem globbing lines. Please refer to the [FIM](../deployment/file-integrity-monitoring.md) guide for details on how to use osquery as a FIM tool.
+
+Example:
+```json
+{
+  "file_paths": {
+    "custom_category": [
+      "/etc/**",
+      "/tmp/.*"
+    ],
+    "device_nodes": [
+      "/dev/*"
+    ]
+  },
+  "file_accesses": [
+    "custom_category"
+  ]
+}
+```
+
+The file paths set has a sister key: `file_accesses` which contains a set of categories names that opt-in for filesystem access monitoring.
+
+### YARA
+
+The `yara` key uses two subkeys to configure YARA signatures: `signatures`, and to define a mapping for signature sets to categories of `file_paths` defined in the "file paths" configuration. Please refer to the much more detailed [YARA](../deployment/yara.md) deployment guide.
+
+Example:
+```json
+{
+  "yara": {
+    "signatures": {
+      "signature_group_1": [
+        "/path/to/signature.sig"
+      ]
+    },
+    "file_paths": {
+      "custom_category": [
+        "signature_group_1"
+      ]
+    }
+  }
+}
+```
+
+There is a strict relationship between the top-level `file_paths` key, and `yara`'s equivalent subkey.
+
+### Prometheus
+
+The `prometheus_targets` key can be used to configure Prometheus targets to be queried. The metric timestamp of millisecond precision is taken when the target response is received.  The `prometheus_targets` parent key consists of a child key `urls`, which contains a list target urls to be scraped, and an optional child key `timeout` which contains the request timeout duration in seconds (defaults to 1 second if not provided).
+
+Example:
+```json
+{
+  "prometheus_targets": {
+    "timeout": 5,
+    "urls": [
+      "http://localhost:9100/metrics",
+      "http://localhost:9101/metrics"
+    ]
+  }
+}
+```
+
+### Views
+
+Views are saved queries expressed as tables. Large subqueries or complex joining logic can often be moved into views allowing you to make your queries more concise.
+
+Example:
+```json
+{
+  "views": {
+    "kernel_hashses" : "SELECT hash.path AS kernel_binary, version, hash.sha256 AS sha256, hash.sha1 AS sha1, hash.md5 AS md5 FROM (SELECT path || '/Contents/MacOS/' AS directory, name, version FROM kernel_extensions) JOIN hash USING (directory);"
+  }
+}
+```
+
+```SQL
+SELECT * FROM kernel_hashes WHERE kernel_binary NOT LIKE "%apple%";
+```
+
+### EC2
+
+There are two tables that provide EC2 instance related information. On non-EC2 instances these tables return empty results. `ec2_instance_metadata` table contains instance meta data information. `ec2_instance_tags` returns tags for the EC2 instance osquery is running on. Retrieving tags for EC2 instance requires authentication and appropriate permission. There are multiple ways credentials can be provided to osquery. See [AWS logging configuration](../deployment/aws-logging.md#configuration) for configuring credentials. AWS region (`--aws_region`) argument is not required and will be ignored by `ec2_instance_tags` implementation. The credentials configured should have permission to perform `ec2:DescribeTags` action.
+
+### Decorator queries
+
+Decorator queries exist in osquery versions 1.7.3+ and are used to add additional "decorations" to results and snapshot logs. There are three types of decorator queries based on when and how you want the decoration data.
+
+```json
+{
+  "decorators": {
+    "load": [
+      "SELECT version FROM osquery_info;",
+      "SELECT uuid AS host_uuid FROM system_info;"
+    ],
+    "always": [
+      "SELECT user AS username FROM logged_in_users WHERE user <> '' ORDER BY time LIMIT 1;"
+    ],
+    "interval": {
+      "3600": [
+        "SELECT total_seconds AS uptime FROM uptime;"
+      ]
+    }
+  }
+}
+```
+
+The types of decorators are:
+* `load`: run these decorators when the configuration loads (or is reloaded)
+* `always`: run these decorators before each query in the schedule
+* `interval`: a special key that defines a map of interval times, see below
+
+Each decorator query should return at most 1 row. A warning will be generated if more than 1 row is returned as they will be forcefully ignored and constitute undefined behavior. Each decorator query should be careful not to emit column collisions, this is also undefined behavior.
+
+The columns, and their values, will be appended to each log line as follows. Assuming the above set of decorators is used, and the schedule is execution for over an hour (3600 seconds):
+
+```json
+{"decorations": {"user": "you", "uptime": "10000", "version": "1.7.3"}}
+```
+
+Expect the normal set of log keys to be included and note that `decorations` is a top-level key in the log line whose value is an embedded map.
+
+The configuration flag `decorators_top_level` can be set to `true` to make decorator data populate as top level key/value objects instead of being contained as a child of `decorations`.  When using this feature, you must be weary of key collisions in existing, reserved, top-level keys.  When collisions do occur, existing key/value data will likely be overritten by the decorator key/value.  The following example shows the results of collisions on various top-level keys:
+
+Example configuration:
+
+````json
+{
+  "decorators": {
+    "load": [
+      "SELECT 'collision' AS name;",
+      "SELECT 'collision' AS hostIdentifier;",
+      "SELECT 'collision' AS calendarTime;",
+      "SELECT 'collision' AS unixTime;",
+      "SELECT 'collision' AS columns;",
+      "SELECT 'collision' AS action;"
+    ]
+  }
+}
+````
+
+Example output:
+
+````json
+{
+  "name": "collision",
+  "hostIdentifier": "collision",
+  "calendarTime": "collision",
+  "unixTime": "collision",
+  "action": "added",
+  "columns": {
+    "cpu_brand": "Intel(R) Core(TM) i7-4980HQ CPU @ 2.80GHz",
+    "hostname": "osquery.example.com",
+    "physical_memory": "1234567890"
+  }
+}
+````
+
+The `interval` type uses a map of interval 'periods' as keys, and the set of decorator queries for each value. Each of these intervals MUST be minute-intervals. Anything not divisible by 60 will generate a warning, and will not run.
 
 ## Chef Configuration
 
-Here are example chef cookbook recipes and files for OS X and Linux
+Here are example chef cookbook recipes and files for macOS and Linux
 deployments.  Consider improving the recipes using node attributes to further
 control what nodes and clients enable osquery. It helps to create a canary or a
 testing set that implements a separate "testing" configuration. These recipes
-assume you are deploying the OS X package or the Linux package separately.
+assume you are deploying the macOS package or the Linux package separately.
 
-### Chef OS X
+### Chef OS X / macOS
 
 Consider the default recipe:
 
 ```ruby
-# Domain used by the OS X LaunchDaemon.
+# Domain used by the macOS LaunchDaemon.
 domain = 'com.facebook.osquery.osqueryd'
 config_path = '/var/osquery/osquery.conf'
 pid_path = '/var/osquery/osquery.pid'
@@ -217,205 +652,8 @@ service service_name do
 end
 ```
 
-And the same configuration file from the OS X example is appropriate.
-
-## Query Packs
-
-Configuration supports sets, called packs, of queries that help define your
-schedule. Packs are distributed with osquery and labeled based on broad
-categories of information and visibility. For example, a "compliance" pack will
-include queries that check for changes in locked down operating system features
-and user settings. A "vulnerability management" pack may perform general asset
-management queries that build event logs around package and software install
-changes.
-
-In an osquery configuration JSON, packs are defined as a top-level-key and
-consist of pack name to pack content JSON data structures.
-
-```json
-{
-  "schedule": {...},
-  "packs": {
-    "internal_stuff": {
-      "discovery": [
-        "select pid from processes where name = 'ldap';"
-      ],
-      "platform": "linux",
-      "version": "1.5.2",
-			"queries": {
-        "active_directory": {
-          "query": "select * from ad_config;",
-          "interval": "1200",
-          "description": "Check each user's active directory cached settings."
-        }
-      }
-    },
-    "testing": {
-      "shard": "10",
-      "queries": {
-        "suid_bins": {
-          "query": "select * from suid_bins;",
-          "interval": "3600",
-        }
-      }
-    }
-  }
-}
-```
-
-The pack value may also be a string, such as:
-
-```json
-{
-  "packs": {
-    "external_pack": "/path/to/external_pack.conf",
-    "internal_stuff": {
-      [...]
-    }
-  }
-}
-```
-
-If using a string instead of an inline JSON dictionary the configuration plugin will be asked to "generate" that resource. In the case of the default **filesystem** plugin, these strings are considered paths.
-
-Queries added to the schedule from packs inherit the pack name as part of the scheduled query name identifier. For example, consider the embedded `active_directory` query above, it is in the `internal_stuff` pack so the scheduled query name becomes: `pack_internal_stuff_active_directory`. The delimiter can be changed using the `--pack_delimiter=_`, see the [CLI Options](../installation/cli-flags.md) for more details.
-
-### Discovery queries
-
-Discovery queries are a feature of query packs that make it much easier to monitor services at scale. Consider that there are some groups of scheduled
-queries which should only be run on a host when a condition is true. For
-example, perhaps you want to write some queries to monitor MySQL. You've made a
-pack called "mysql" and now you only want the queries in that pack to execute
-if the `mysqld` program is running on the host.
-
-Without discovery queries, you could have your configuration management write a
-different configuration file for your MySQL tier. Unfortunately, however, this
-requires you to know the complete set of hosts in your environment which are
-running MySQL. This is problematic, especially if engineers in your environment
-can install arbitrary software on arbitrary hosts. If MySQL is installed on a
-non-standard host, you have no way to know. Therefore, you cannot schedule your MySQL pack on those hosts through configuration management logic.
-
-One solution to this problem is discovery queries.
-
-Query packs allow you to define a set of osquery queries which control whether
-or not the pack will execute. Discovery queries are represented by the
-top-level "discovery" key-word in a pack. The value should be a list of osquery
-queries. If all of the queries return more than zero rows, then the queries are
-added to the query schedule. This allows you to distribute configurations for
-many services and programs, while ensuring that only relevant queries will be
-executing on your host.
-
-You don't need to define any discovery queries for a pack. If no discovery
-queries are defined, then the pack will always execute.
-
-Discovery queries look like:
-
-```json
-{
-  "discovery": [
-    "select pid from processes where name = 'foobar';",
-    "select count(*) from users where username like 'www%';"
-  ],
-	"queries": {}
-}
-```
-
-In the above example, the pack will only execute on hosts which are running
-processes called "foobar" or has users that start with "www".
-
-Discovery queries are refreshed for all packs every 60 minutes. You can
-change this value via the `pack_refresh_interval` configuration option.
-
-**Where do packs go?**
-
-The default way to define a query pack is in the main configuration file.
-Consider the following example:
-
-```json
-{
-  "options": {
-    "enable_monitor": "true"
-  },
-  "packs": {
-    "foo": {
-      "queries": {}
-    },
-    "bar": {
-      "queries": {}
-    }
-  }
-}
-```
-
-Alternatively, however, you can also define the value of a pack as a raw
-string. Consider the following example:
-
-```json
-{
-  "options": {
-    "enable_monitor": "true"
-  },
-  "packs": {
-    "foo": "/tmp/foo.json",
-    "bar": "/tmp/bar.json"
-  }
-}
-```
-
-In the above example, the packs are defined using a local filesystem path.
-When osquery's config parser is provided a string instead of inline dictionary the active config plugin is called to resolve what should be done to go from `/tmp/foo.json` to the actual content of the pack. See [configuration plugin](../development/config-plugins.md) development for more information on packs.
-
-### Options
-
-In addition to discovery and queries, a pack may contain a **platform**, **shard**, or **version** key. Specifying platform allows you to specify that the pack should only be executed on "linux", "darwin", etc. The shard key applies Chef-style percentage sharding. Appropriate values range from 1 - 100 and represent a percentage of hosts that should use this pack. Values over 100 are equivalent to 100%, 0 discounts the shard option. The hosts that fall into the range are a deterministic 10%. The version key can set a minimum supported version for this query.
-
-In practice, this looks like:
-
-```json
-{
-  "platform": "any",
-  "version": "1.5.0",
-  "shard": "10",
-  "queries": {}
-}
-```
-
-Additionally, you can specify platform and version on individual queries in
-a pack. For example:
-
-```json
-{
-	"platform": "any",
-	"version": "1.5.0",
-	"queries": {
-		"info": {
-			"query": "select * from osquery_info;",
-			"interval": 60
-		},
-		"packs": {
-			"query": "select * from osquery_packs;",
-			"interval": 60,
-			"version": "1.5.2"
-		}
-	}
-}
-```
-
-In this example, the **info** query will run on osquery version 1.5.0 and above
-since the minimum version defined for the global pack is 1.5.0. The **packs**
-query, however, defines an additional version constraint, therefore the **packs** query will only run on osquery version 1.5.2 and above.
-
-**Where can I get more existing packs?**
-
-We release (and bundle alongside RPMs/DEBs/PKGs/etc.) query packs that emit high signal events as well as event data that is worth storing in the case of future incidents and security events. The queries within each pack will be performance tested and well-formed (JOIN, select-limited, etc.). But it is always an exercise for the user to make sure queries are useful and are not impacting performance critical hosts. You can find the query packs that are released by the osquery team documented at [https://osquery.io/docs/packs] and the content in [**/packs**](https://github.com/facebook/osquery/blob/master/packs) within the osquery repository.
-
-**How do I modify the default options in the provided packs?**
-
-We don't offer a built-in way to modify the default intervals / options in the
-supplied query packs. Fortunately, however, packs are just JSON. Therefore, it
-would be rather trivial to write a tool which reads in pack JSON, modifies it
-in some way, then re-writes the JSON.
+And the same configuration file from the macOS example is appropriate.
 
 ## osqueryctl helper
 
-To test a deploy or configuration we include a short helper script called **osqueryctl**. There are several actions including "start", "stop", and "config-check" that apply to both OS X and Linux.
+To test a deploy or configuration we include a short helper script called **osqueryctl**. There are several actions including "start", "stop", and "config-check" that apply to both macOS and Linux.

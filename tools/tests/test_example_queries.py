@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
@@ -31,6 +31,9 @@ class ExampleQueryTests(test_base.QueryTester):
 
     @test_base.flaky
     def test_platform_specific_queries(self):
+        posix = ["darwin", "linux"]
+        if utils.platform() in posix:
+            self._execute_set(PLATFORM_EXAMPLES["posix"])
         self._execute_set(PLATFORM_EXAMPLES[utils.platform()])
 
     @test_base.flaky
@@ -50,7 +53,12 @@ if __name__ == '__main__':
     for category in API:
         PLATFORM_EXAMPLES[category["key"]] = []
         for table in category["tables"]:
-            PLATFORM_EXAMPLES[category["key"]] += table["examples"]
+            if len(table["examples"]) > 0:
+                PLATFORM_EXAMPLES[category["key"]] += table["examples"]
+            else:
+                PLATFORM_EXAMPLES[category["key"]] += [
+                    "select * from %s limit 1" % table["name"]
+                ]
 
     module = test_base.Tester()
 

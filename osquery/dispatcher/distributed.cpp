@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,8 +8,13 @@
  *
  */
 
+#include <osquery/database.h>
+#include <osquery/distributed.h>
+#include <osquery/flags.h>
+#include <osquery/system.h>
+
+#include "osquery/core/conversions.h"
 #include "osquery/dispatcher/distributed.h"
-#include "osquery/distributed.h"
 
 namespace osquery {
 
@@ -21,20 +26,32 @@ FLAG(uint64,
 DECLARE_bool(disable_distributed);
 DECLARE_string(distributed_plugin);
 
+const size_t kDistributedAccelerationInterval = 5;
+
 void DistributedRunner::start() {
   auto dist = Distributed();
-  while (true) {
+  while (!interrupted()) {
     dist.pullUpdates();
     if (dist.getPendingQueryCount() > 0) {
       dist.runQueries();
     }
-    ::sleep(FLAGS_distributed_interval);
+
+    std::string str_acu = "0";
+    Status database = getDatabaseValue(
+        kPersistentSettings, "distributed_accelerate_checkins_expire", str_acu);
+    unsigned long accelerate_checkins_expire;
+    Status conversion = safeStrtoul(str_acu, 10, accelerate_checkins_expire);
+    if (!database.ok() || !conversion.ok() ||
+        getUnixTime() > accelerate_checkins_expire) {
+      pauseMilli(FLAGS_distributed_interval * 1000);
+    } else {
+      pauseMilli(kDistributedAccelerationInterval * 1000);
+    }
   }
 }
 
 Status startDistributed() {
-  if (!FLAGS_disable_distributed && !FLAGS_distributed_plugin.empty() &&
-      Registry::getActive("distributed") == FLAGS_distributed_plugin) {
+  if (!FLAGS_disable_distributed) {
     Dispatcher::addService(std::make_shared<DistributedRunner>());
     return Status(0, "OK");
   } else {

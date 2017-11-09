@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -16,6 +16,8 @@
 #include <osquery/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/tables.h>
+
+#include "osquery/core/conversions.h"
 
 namespace fs = boost::filesystem;
 namespace pt = boost::property_tree;
@@ -77,7 +79,13 @@ Status getHomebrewCellar(fs::path& cellarPath) {
 
   // Note that the first `parent_path` call is to remove the filename, and the
   // next to actually move up a directory.
-  auto path = brewExecutable.parent_path().parent_path() / "Cellar";
+  auto path = brewExecutable.parent_path().parent_path();
+  // Newer versions of Homebrew may include a 'Homebrew' directory.
+  if ("Homebrew" == path.leaf().string()) {
+    path = path.parent_path();
+  }
+
+  path /= "Cellar";
   if (!pathExists(path).ok()) {
     return Status(1, "No Homebrew Cellar found");
   }

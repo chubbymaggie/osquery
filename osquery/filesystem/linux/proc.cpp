@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -69,12 +69,8 @@ Status procReadDescriptor(const std::string& process,
   auto size = readlink(link.c_str(), result_path, sizeof(result_path) - 1);
   if (size >= 0) {
     result = std::string(result_path);
+    return Status(0);
   }
-
-  if (size >= 0) {
-    return Status(0, "OK");
-  } else {
-    return Status(1, "Could not read path");
-  }
+  return Status(1, "Could not read path");
 }
 }

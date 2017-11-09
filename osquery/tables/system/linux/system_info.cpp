@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,7 +13,9 @@
 #include <osquery/filesystem.h>
 #include <osquery/tables.h>
 #include <osquery/sql.h>
+#include <osquery/system.h>
 
+#include "osquery/core/conversions.h"
 #include "osquery/tables/system/linux/smbios_utils.h"
 
 namespace osquery {
@@ -21,8 +23,9 @@ namespace tables {
 
 QueryData genSystemInfo(QueryContext& context) {
   Row r;
-  r["hostname"] = osquery::getHostname();
-  r["computer_name"] = r["hostname"];
+  r["hostname"] = osquery::getFqdn();
+  r["computer_name"] = osquery::getHostname();
+  r["local_hostname"] = r["hostname"];
 
   std::string uuid;
   r["uuid"] = (osquery::getHostUUID(uuid)) ? uuid : "";

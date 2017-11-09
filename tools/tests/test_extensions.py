@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
@@ -22,9 +22,9 @@ import time
 import threading
 import unittest
 
-
 # osquery-specific testing utils
 import test_base
+import utils
 
 EXTENSION_TIMEOUT = 10
 
@@ -212,7 +212,7 @@ class ExtensionTests(test_base.ProcessGenerator, unittest.TestCase):
 
         # Get a python-based thrift client
         client = test_base.EXClient(extension.options["extensions_socket"])
-        test_base.expectTrue(client.open)
+        test_base.expectTrue(client.try_open)
         self.assertTrue(client.open(timeout=EXTENSION_TIMEOUT))
         em = client.getEM()
 
@@ -228,6 +228,30 @@ class ExtensionTests(test_base.ProcessGenerator, unittest.TestCase):
     def test_6_extensions_autoload(self):
         loader = test_base.Autoloader(
             [test_base.ARGS.build + "/osquery/example_extension.ext"])
+        daemon = self._run_daemon({
+            "disable_watchdog": True,
+            "extensions_timeout": EXTENSION_TIMEOUT,
+            "extensions_autoload": loader.path,
+        })
+        self.assertTrue(daemon.isAlive())
+
+        # Get a python-based thrift client
+        client = test_base.EXClient(daemon.options["extensions_socket"])
+        self.assertTrue(client.open(timeout=EXTENSION_TIMEOUT))
+        em = client.getEM()
+
+        # The waiting extension should have connected to the daemon.
+        result = test_base.expect(em.extensions, 1)
+        self.assertEqual(len(result), 1)
+
+        client.close()
+        daemon.kill(True)
+
+    @test_base.flaky
+    def test_6_extensions_directory_autoload(self):
+        utils.copy_file(test_base.ARGS.build + "/osquery/example_extension.ext",
+            test_base.CONFIG_DIR)
+        loader = test_base.Autoloader([test_base.CONFIG_DIR])
         daemon = self._run_daemon({
             "disable_watchdog": True,
             "extensions_timeout": EXTENSION_TIMEOUT,
@@ -277,7 +301,6 @@ class ExtensionTests(test_base.ProcessGenerator, unittest.TestCase):
             "extensions_autoload": loader.path,
             "extensions_timeout": EXTENSION_TIMEOUT,
             "config_plugin": "example",
-            "verbose": True,
         })
         self.assertTrue(daemon.isAlive())
 
@@ -310,7 +333,7 @@ class ExtensionTests(test_base.ProcessGenerator, unittest.TestCase):
 
         # Get a python-based thrift client to the manager and extension.
         client = test_base.EXClient(extension.options["extensions_socket"])
-        test_base.expectTrue(client.open)
+        test_base.expectTrue(client.try_open)
         self.assertTrue(client.open(timeout=EXTENSION_TIMEOUT))
         em = client.getEM()
 
@@ -320,7 +343,7 @@ class ExtensionTests(test_base.ProcessGenerator, unittest.TestCase):
         ex_uuid = result.keys()[0]
         client2 = test_base.EXClient(extension.options["extensions_socket"],
             uuid=ex_uuid)
-        test_base.expectTrue(client2.open)
+        test_base.expectTrue(client2.try_open)
         self.assertTrue(client2.open(timeout=EXTENSION_TIMEOUT))
         ex = client2.getEX()
 
@@ -342,6 +365,42 @@ class ExtensionTests(test_base.ProcessGenerator, unittest.TestCase):
         extension.kill()
         daemon.kill()
 
+    @test_base.flaky
+    def test_91_extensions_settings(self):
+        loader = test_base.Autoloader(
+            [test_base.ARGS.build + "/osquery/example_extension.ext"])
+        daemon = self._run_daemon({
+            "disable_watchdog": True,
+            "extensions_timeout": EXTENSION_TIMEOUT,
+            "extensions_autoload": loader.path,
+        })
+        self.assertTrue(daemon.isAlive())
+
+        # Get a python-based thrift client for the manager (core).
+        client = test_base.EXClient(daemon.options["extensions_socket"])
+        self.assertTrue(client.open(timeout=EXTENSION_TIMEOUT))
+        em = client.getEM()
+
+        # The waiting extension should have connected to the daemon.
+        # This expect statement will block with a short timeout.
+        result = test_base.expect(em.extensions, 1)
+        self.assertEqual(len(result), 1)
+
+        # The 'complex_example' table reports several columns.
+        # Each is a 'test_type', check each expected value.
+        result = em.query("select * from complex_example")
+        if len(result.response) == 0:
+            # There is a brief race between register and registry broadcast
+            # That fast external client fight when querying tables.
+            # Other config/logger plugins have wrappers to retry/wait.
+            time.sleep(0.5)
+            result = em.query("select * from complex_example")
+
+        self.assertEqual(result.response[0]['flag_test'], 'false')
+        self.assertEqual(result.response[0]['database_test'], '1')
+
+        client.close()
+        daemon.kill(True)
 
 if __name__ == "__main__":
     test_base.assertPermissions()

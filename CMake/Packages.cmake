@@ -1,154 +1,80 @@
+#  Copyright (c) 2014-present, Facebook, Inc.
+#  All rights reserved.
+#
+#  This source code is licensed under the BSD-style license found in the
+#  LICENSE file in the root directory of this source tree. An additional grant
+#  of patent rights can be found in the PATENTS file in the same directory.
+
 # make package
 if(APPLE)
   add_custom_target(
     packages
-    COMMAND "${CMAKE_SOURCE_DIR}/tools/deployment/make_osx_package.sh"
-    COMMAND "${CMAKE_SOURCE_DIR}/tools/codegen/genapi.py" "${CMAKE_SOURCE_DIR}"
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tools/deployment/make_osx_package.sh"
+    COMMAND ${PYTHON_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/codegen/genapi.py" "${CMAKE_SOURCE_DIR}"
       "--output" "--directory" "${CMAKE_BINARY_DIR}"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building default OS X package (no custom config)" VERBATIM
     DEPENDS daemon shell
   )
 elseif(LINUX)
-  if(DEBIAN_BASED)
-    # Set basic catch-alls for debian-based systems.
-    set(PACKAGE_TYPE "deb")
-    set(PACKAGE_ITERATION "1.debian")
-    set(PACKAGE_DEPENDENCIES
-      "zlib1g"
-      "libbz2-1.0"
-      "libreadline6"
-    )
-
-    # Improve catch-alls for debian or ubuntu.
-    if(OSQUERY_BUILD_PLATFORM STREQUAL "ubuntu")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libgcrypt11"
-      )
-    elseif(OSQUERY_BUILD_PLATFORM STREQUAL "debian")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libgcrypt20"
-      )
-    endif()
-
-    # Improve package and iterations for each specific distribution.
-    if(NOT OSQUERY_BUILD_DISTRO STREQUAL "lucid")
-      set(PACKAGE_ITERATION "1.ubuntu10")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libc6 (>=2.15)"
-        "libapt-pkg4.12"
-      )
-    endif()
-
-    if(OSQUERY_BUILD_DISTRO STREQUAL "precise")
-      set(PACKAGE_ITERATION "1.ubuntu12")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libstdc++6"
-        "libudev0"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "wheezy")
-      set(PACKAGE_ITERATION "1.debian7")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libstdc++6"
-        "libudev0"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "trusty")
-      set(PACKAGE_ITERATION "1.ubuntu14")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libstdc++6 (>= 4.8)"
-        "libudev1"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "jessie")
-      set(PACKAGE_ITERATION "1.debian8")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libstdc++6 (>= 4.8)"
-        "libudev1"
-      )
-    endif()
-  elseif(REDHAT_BASED)
-    set(PACKAGE_TYPE "rpm")
-    set(PACKAGE_ITERATION "1.el")
-    set(PACKAGE_DEPENDENCIES
-      "glibc >= 2.12"
-      "openssl >= 1.0"
-      "bzip2-libs"
-      "readline"
-      "zlib"
-      "rpm-libs"
-    )
-    if(OSQUERY_BUILD_DISTRO STREQUAL "centos6")
-      set(PACKAGE_ITERATION "1.el6")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libudev"
-        "device-mapper >= 1.02.90"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "rhel6")
-      set(PACKAGE_ITERATION "1.rhel6")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libudev"
-        "device-mapper >= 1.02.90"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "oracle6")
-      set(PACKAGE_ITERATION "1.oel6")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "libudev"
-        "device-mapper >= 1.02.90"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "centos7")
-      set(PACKAGE_ITERATION "1.el7")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "device-mapper >= 7:1.02.90"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "rhel7")
-      set(PACKAGE_ITERATION "1.rhel7")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "device-mapper >= 7:1.02.90"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "oracle7")
-      set(PACKAGE_ITERATION "1.oel7")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "device-mapper >= 7:1.02.90"
-      )
-    elseif(OSQUERY_BUILD_DISTRO STREQUAL "amazon2015.03")
-      set(PACKAGE_ITERATION "1.amazon2015")
-      set(PACKAGE_DEPENDENCIES
-        "${PACKAGE_DEPENDENCIES}"
-        "device-mapper >= 7:1.02.90"
-      )
-    endif()
-  endif()
-  JOIN("${PACKAGE_DEPENDENCIES}" ", " PACKAGE_DEPENDENCIES)
-
   add_custom_target(
     packages
-    COMMAND "${CMAKE_SOURCE_DIR}/tools/deployment/make_linux_package.sh"
-      -t ${PACKAGE_TYPE} -i "${PACKAGE_ITERATION}"
-      -d "${PACKAGE_DEPENDENCIES}"
-    COMMAND "${CMAKE_SOURCE_DIR}/tools/codegen/genapi.py" "${CMAKE_SOURCE_DIR}"
-      "--output" "--directory" "${CMAKE_BINARY_DIR}"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building linux packages (no custom config)" VERBATIM
     DEPENDS daemon shell
   )
+
+  set(DEB_PACKAGE_DEPENDENCIES "libc6 (>=2.12), zlib1g")
+  set(RPM_PACKAGE_DEPENDENCIES "glibc >= 2.12, zlib")
+  set(PACMAN_PACKAGE_DEPENDENCIES "zlib")
+
+  find_program(FPM_EXECUTABLE "fpm" ENV PATH)
+  find_program(RPMBUILD_EXECUTABLE "rpmbuild" ENV PATH)
+  find_program(BSDTAR_EXECUTABLE "bsdtar" ENV PATH)
+
+  if(FPM_EXECUTABLE)
+    add_custom_command(TARGET packages PRE_BUILD
+      COMMAND bash "${CMAKE_SOURCE_DIR}/tools/deployment/make_linux_package.sh"
+        -t "deb" -i "1.linux" -d '${DEB_PACKAGE_DEPENDENCIES}'
+    )
+
+    if(RPMBUILD_EXECUTABLE)
+      add_custom_command(TARGET packages PRE_BUILD
+        COMMAND bash "${CMAKE_SOURCE_DIR}/tools/deployment/make_linux_package.sh"
+          -t "rpm" -i "1.linux" -d '${RPM_PACKAGE_DEPENDENCIES}'
+      )
+    else()
+      WARNING_LOG("Skipping RPM/CentOS packages: Cannot find rpmbuild")
+    endif()
+
+    if(BSDTAR_EXECUTABLE)
+      add_custom_command(TARGET packages PRE_BUILD
+        COMMAND bash "${CMAKE_SOURCE_DIR}/tools/deployment/make_linux_package.sh"
+          -t "pacman" -i "1.arch" -d '${PACMAN_PACKAGE_DEPENDENCIES}'
+      )
+    else()
+      WARNING_LOG("Skipping ArchLinux packages: Cannot find bsdtar")
+    endif()
+
+    add_custom_command(TARGET packages PRE_BUILD
+      COMMAND bash "${CMAKE_SOURCE_DIR}/tools/deployment/make_linux_package.sh"
+        -t "tar" -i "1.linux" -d "none"
+    )
+
+  else()
+    WARNING_LOG("Cannot find fpm executable in path")
+  endif()
+
 endif()
 
-# Add dependencies and additional package data based on optional components.
+if(NOT SKIP_KERNEL)
+  if(NOT DEFINED KERNEL_BINARY)
+    message(FATAL_ERROR "Package related targets must be included after kernel")
+  endif()
 
-if(NOT ${KERNEL_BINARY} STREQUAL "" AND
-    EXISTS "${CMAKE_BINARY_DIR}/kernel/${KERNEL_BINARY}")
-  # The osquery kernel was built
-  add_dependencies(packages kernel-build)
+  # Add dependencies and additional package data based on optional components.
+  if(EXISTS "${CMAKE_BINARY_DIR}/kernel/${KERNEL_BINARY}")
+    # The osquery kernel was built
+    add_dependencies(packages kernel-build)
+  endif()
 endif()

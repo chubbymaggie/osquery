@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -48,6 +48,7 @@ void genLibraryStartupItems(const std::string& sysdir, QueryData& results) {
       r["name"] = it->path().string();
       r["path"] = it->path().string();
       r["type"] = "Startup Item";
+      r["status"] = "enabled";
       r["source"] = sysdir;
       results.push_back(r);
     }

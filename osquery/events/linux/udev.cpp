@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -7,6 +7,8 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
+
+#include <poll.h>
 
 #include <osquery/events.h>
 #include <osquery/filesystem.h>
@@ -21,62 +23,82 @@ static const int kUdevMLatency = 200;
 REGISTER(UdevEventPublisher, "event_publisher", "udev");
 
 Status UdevEventPublisher::setUp() {
+  // The Setup and Teardown workflows should be protected against races.
+  // Just in case let's protect the publisher's resources.
+  WriteLock lock(mutex_);
+
   // Create the udev object.
   handle_ = udev_new();
-  if (!handle_) {
+  if (handle_ == nullptr) {
     return Status(1, "Could not create udev object.");
   }
 
   // Set up the udev monitor before scanning/polling.
   monitor_ = udev_monitor_new_from_netlink(handle_, "udev");
-  udev_monitor_enable_receiving(monitor_);
+  if (monitor_ == nullptr) {
+    udev_unref(handle_);
+    handle_ = nullptr;
+    return Status(1, "Could not create udev monitor.");
+  }
 
+  udev_monitor_enable_receiving(monitor_);
   return Status(0, "OK");
 }
 
-void UdevEventPublisher::configure() {}
-
 void UdevEventPublisher::tearDown() {
+  WriteLock lock(mutex_);
   if (monitor_ != nullptr) {
     udev_monitor_unref(monitor_);
+    monitor_ = nullptr;
   }
 
   if (handle_ != nullptr) {
     udev_unref(handle_);
+    handle_ = nullptr;
   }
 }
 
 Status UdevEventPublisher::run() {
-  int fd = udev_monitor_get_fd(monitor_);
-  fd_set set;
+  int fd = 0;
 
-  FD_ZERO(&set);
-  FD_SET(fd, &set);
+  {
+    WriteLock lock(mutex_);
+    if (monitor_ == nullptr) {
+      return Status(1);
+    }
+    fd = udev_monitor_get_fd(monitor_);
+  }
 
-  struct timeval timeout = {1, 0};
-  int selector = ::select(fd + 1, &set, nullptr, nullptr, &timeout);
-  if (selector == -1) {
+  struct pollfd fds[1];
+  fds[0].fd = fd;
+  fds[0].events = POLLIN;
+
+  int selector = ::poll(fds, 1, 1000);
+  if (selector == -1 && errno != EINTR && errno != EAGAIN) {
     LOG(ERROR) << "Could not read udev monitor";
     return Status(1, "udev monitor failed.");
   }
 
-  if (selector == 0 || !FD_ISSET(fd, &set)) {
+  if (selector == 0 || !(fds[0].revents & POLLIN)) {
     // Read timeout.
     return Status(0, "Finished");
   }
 
-  struct udev_device *device = udev_monitor_receive_device(monitor_);
-  if (device == nullptr) {
-    LOG(ERROR) << "udev monitor returned invalid device";
-    return Status(1, "udev monitor failed.");
+  {
+    WriteLock lock(mutex_);
+    struct udev_device* device = udev_monitor_receive_device(monitor_);
+    if (device == nullptr) {
+      LOG(ERROR) << "udev monitor returned invalid device";
+      return Status(1, "udev monitor failed.");
+    }
+
+    auto ec = createEventContextFrom(device);
+    fire(ec);
+
+    udev_device_unref(device);
   }
 
-  auto ec = createEventContextFrom(device);
-  fire(ec);
-
-  udev_device_unref(device);
-
-  osquery::publisherSleep(kUdevMLatency);
+  pauseMilli(kUdevMLatency);
   return Status(0, "OK");
 }
 

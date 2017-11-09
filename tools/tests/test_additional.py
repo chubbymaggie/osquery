@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
@@ -55,7 +55,7 @@ class AdditionalFeatureTests(test_base.ProcessGenerator, unittest.TestCase):
 
         # Introspect into the daemon's query packs.
         client = test_base.EXClient(daemon.options["extensions_socket"])
-        test_base.expectTrue(client.open)
+        test_base.expectTrue(client.try_open)
         self.assertTrue(client.open())
         em = client.getEM()
 

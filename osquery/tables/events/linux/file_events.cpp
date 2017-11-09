@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -29,7 +29,6 @@ namespace osquery {
 class FileEventSubscriber : public EventSubscriber<INotifyEventPublisher> {
  public:
   Status init() override {
-    configure();
     return Status(0);
   }
 
@@ -59,19 +58,18 @@ REGISTER(FileEventSubscriber, "event_subscriber", "file_events");
 void FileEventSubscriber::configure() {
   // Clear all monitors from INotify.
   // There may be a better way to find the set intersection/difference.
-  auto pub = getPublisher();
-  pub->removeSubscriptions();
+  removeSubscriptions();
 
   auto parser = Config::getParser("file_paths");
   auto& accesses = parser->getData().get_child("file_accesses");
-  Config::getInstance().files([this, &accesses](
-      const std::string& category, const std::vector<std::string>& files) {
+  Config::get().files([this, &accesses](const std::string& category,
+                                        const std::vector<std::string>& files) {
     for (const auto& file : files) {
       VLOG(1) << "Added file event listener to: " << file;
       auto sc = createSubscriptionContext();
       // Use the filesystem globbing pattern to determine recursiveness.
       sc->recursive = 0;
-      sc->path = file;
+      sc->opath = sc->path = file;
       sc->mask = kFileDefaultMasks;
       if (accesses.count(category) > 0) {
         sc->mask |= kFileAccessMasks;
@@ -93,13 +91,18 @@ Status FileEventSubscriber::Callback(const ECRef& ec, const SCRef& sc) {
   r["category"] = sc->category;
   r["transaction_id"] = INTEGER(ec->event->cookie);
 
-  // Add hashing and 'join' against the file table for stat-information.
-  decorateFileEvent(
-      ec->path, (ec->action == "CREATED" || ec->action == "UPDATED"), r);
+  if ((sc->mask & kFileAccessMasks) != kFileAccessMasks) {
+    // Add hashing and 'join' against the file table for stat-information.
+    decorateFileEvent(
+        ec->path, (ec->action == "CREATED" || ec->action == "UPDATED"), r);
+  } else {
+    // The access event on Linux would generate additional events if hashed.
+    decorateFileEvent(ec->path, false, r);
+  }
 
   // A callback is somewhat useless unless it changes the EventSubscriber
   // state or calls `add` to store a marked up event.
-  add(r, ec->time);
+  add(r);
   return Status(0, "OK");
 }
 }

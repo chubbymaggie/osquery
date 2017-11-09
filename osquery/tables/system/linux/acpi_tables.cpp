@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,8 +12,9 @@
 
 #include <osquery/core.h>
 #include <osquery/filesystem.h>
-#include <osquery/hash.h>
 #include <osquery/tables.h>
+
+#include "osquery/tables/system/hash.h"
 
 namespace fs = boost::filesystem;
 
@@ -48,7 +49,7 @@ void genACPITable(const std::string& table, QueryData& results) {
     r["size"] = INTEGER(-1);
   } else {
     r["size"] = INTEGER(table_content.size());
-    r["md5"] = osquery::hashFromBuffer(
+    r["md5"] = hashFromBuffer(
         HASH_TYPE_MD5, table_content.c_str(), table_content.length());
   }
 

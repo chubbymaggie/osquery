@@ -1,5 +1,5 @@
 table_name("keychain_items")
-description("Generic details about keychain items")
+description("Generic details about keychain items.")
 schema([
     Column("label", TEXT, "Generic item name"),
     Column("description", TEXT, "Optional item description"),
@@ -9,5 +9,4 @@ schema([
     Column("type", TEXT, "Keychain item type (class)"),
     Column("path", TEXT, "Path to keychain containing item"),
 ])
-attributes(cachable=True)
 implementation("keychain_items@genKeychainItems")

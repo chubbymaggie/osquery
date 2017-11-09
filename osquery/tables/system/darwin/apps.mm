@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -19,8 +19,8 @@
 #include <osquery/core.h>
 #include <osquery/filesystem.h>
 #include <osquery/logger.h>
-#include <osquery/tables.h>
 #include <osquery/sql.h>
+#include <osquery/tables.h>
 
 #include "osquery/core/conversions.h"
 
@@ -184,6 +184,24 @@ void genApplication(const pt::ptree& tree,
   r["name"] = path.parent_path().parent_path().filename().string();
   r["path"] = path.parent_path().parent_path().string();
 
+  NSString* filePath =
+      [NSString stringWithUTF8String:path.parent_path().parent_path().c_str()];
+  MDItemRef mdItem = MDItemCreate(NULL, (CFStringRef)filePath);
+
+  if (mdItem != nullptr) {
+    NSDate* lastOpened = static_cast<NSDate*>(
+        CFBridgingRelease(MDItemCopyAttribute(mdItem, kMDItemLastUsedDate)));
+    if (lastOpened != nullptr) {
+      r["last_opened_time"] = INTEGER([lastOpened timeIntervalSince1970]);
+    } else {
+      r["last_opened_time"] = INTEGER(-1);
+    }
+    CFRelease(mdItem);
+    mdItem = NULL;
+  } else {
+    r["last_opened_time"] = INTEGER(-1);
+  }
+
   // Loop through each column and its mapped Info.plist key name.
   for (const auto& item : kAppsInfoPlistTopLevelStringKeys) {
     r[item.second] = tree.get<std::string>(item.first, "");
@@ -208,7 +226,7 @@ Status genAppsFromLaunchServices(std::set<std::string>& apps) {
   }
 
   auto LSCopyAllApplicationURLs =
-      (OSStatus (*)(CFArrayRef*))CFBundleGetFunctionPointerForName(
+      (OSStatus(*)(CFArrayRef*))CFBundleGetFunctionPointerForName(
           ls_bundle, CFSTR("_LSCopyAllApplicationURLs"));
   // If the symbol did not exist we will not have a handle.
   if (LSCopyAllApplicationURLs == nullptr) {
@@ -221,7 +239,7 @@ Status genAppsFromLaunchServices(std::set<std::string>& apps) {
   }
 
   @autoreleasepool {
-    for (id app in(__bridge NSArray*)ls_apps) {
+    for (id app in (__bridge NSArray*)ls_apps) {
       if (app != nil && [app isKindOfClass:[NSURL class]]) {
         apps.insert(std::string([[app path] UTF8String]) +
                     "/Contents/Info.plist");
@@ -270,6 +288,10 @@ QueryData genApps(QueryContext& context) {
 
   // For each found application (path with an Info.plist) parse the plist.
   for (const auto& path : apps) {
+    if (!osquery::pathExists(path)) {
+      continue;
+    }
+
     if (!osquery::parsePlist(path, tree).ok()) {
       TLOG << "Error parsing application plist: " << path;
       continue;
@@ -279,7 +301,7 @@ QueryData genApps(QueryContext& context) {
     genApplication(tree, path, results);
   }
 
-  return std::move(results);
+  return results;
 }
 
 QueryData genAppSchemes(QueryContext& context) {
@@ -314,9 +336,9 @@ QueryData genAppSchemes(QueryContext& context) {
     CFURLRef default_app = nullptr;
     if (ls_bundle != nullptr) {
       auto _LSCopyDefaultApplicationURLForURL =
-          (CFURLRef (*)(CFURLRef, LSRolesMask, CFErrorRef*))
-          CFBundleGetFunctionPointerForName(
-              ls_bundle, CFSTR("LSCopyDefaultApplicationURLForURL"));
+          (CFURLRef(*)(CFURLRef, LSRolesMask, CFErrorRef*))
+              CFBundleGetFunctionPointerForName(
+                  ls_bundle, CFSTR("LSCopyDefaultApplicationURLForURL"));
       // If the symbol did not exist we will not have a handle.
       if (_LSCopyDefaultApplicationURLForURL != nullptr) {
         default_app =

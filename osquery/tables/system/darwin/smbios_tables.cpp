@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -18,8 +18,8 @@
 
 #include <osquery/tables.h>
 
+#include "osquery/events/darwin/iokit.h"
 #include "osquery/tables/system/smbios_utils.h"
-#include "osquery/tables/system/darwin/iokit_utils.h"
 
 namespace osquery {
 namespace tables {
@@ -109,60 +109,62 @@ QueryData genSMBIOSTables(QueryContext& context) {
 }
 
 QueryData genPlatformInfo(QueryContext& context) {
-  auto entry =
-      IORegistryEntryFromPath(kIOMasterPortDefault, "IODeviceTree:/rom@0");
-  if (entry == MACH_PORT_NULL) {
+  auto rom = IORegistryEntryFromPath(kIOMasterPortDefault, "IODeviceTree:/rom");
+  if (rom == 0) {
     return {};
   }
 
-  // Get the device details
   CFMutableDictionaryRef details = nullptr;
   IORegistryEntryCreateCFProperties(
-      entry, &details, kCFAllocatorDefault, kNilOptions);
+      rom, &details, kCFAllocatorDefault, kNilOptions);
+  IOObjectRelease(rom);
 
-  QueryData results;
-  if (details != nullptr) {
-    Row r;
-    r["vendor"] = getIOKitProperty(details, "vendor");
-    r["volume_size"] = getIOKitProperty(details, "fv-main-size");
-    r["size"] = getIOKitProperty(details, "rom-size");
-    r["date"] = getIOKitProperty(details, "release-date");
-    r["version"] = getIOKitProperty(details, "version");
+  // Success is determined by the details dictionary existence.
+  if (details == nullptr) {
+    return {};
+  }
 
-    {
-      auto address = getIOKitProperty(details, "fv-main-address");
+  Row r;
+  r["vendor"] = getIOKitProperty(details, "vendor");
+  r["volume_size"] = getIOKitProperty(details, "fv-main-size");
+  r["size"] = getIOKitProperty(details, "rom-size");
+  r["date"] = getIOKitProperty(details, "release-date");
+  r["version"] = getIOKitProperty(details, "version");
+
+  {
+    auto address = getIOKitProperty(details, "fv-main-address");
+    if (!address.empty()) {
       auto value = boost::lexical_cast<size_t>(address);
 
       std::stringstream hex_id;
       hex_id << std::hex << std::setw(8) << std::setfill('0') << value;
       r["address"] = "0x" + hex_id.str();
+    } else {
+      r["address"] = "0x0";
     }
-
-    {
-      std::vector<std::string> extra_items;
-      auto info = getIOKitProperty(details, "apple-rom-info");
-      std::vector<std::string> info_lines;
-      iter_split(info_lines, info, boost::algorithm::first_finder("%0a"));
-      for (const auto& line : info_lines) {
-        std::vector<std::string> details;
-        iter_split(details, line, boost::algorithm::first_finder(": "));
-        if (details.size() > 1) {
-          boost::trim(details[1]);
-          if (details[0].find("Revision") != std::string::npos) {
-            r["revision"] = details[1];
-          }
-          extra_items.push_back(details[1]);
-        }
-      }
-      r["extra"] = osquery::join(extra_items, "; ");
-    }
-
-    results.push_back(r);
-    CFRelease(details);
   }
 
-  IOObjectRelease(entry);
-  return results;
+  {
+    std::vector<std::string> extra_items;
+    auto info = getIOKitProperty(details, "apple-rom-info");
+    std::vector<std::string> info_lines;
+    iter_split(info_lines, info, boost::algorithm::first_finder("%0a"));
+    for (const auto& line : info_lines) {
+      std::vector<std::string> details_vec;
+      iter_split(details_vec, line, boost::algorithm::first_finder(": "));
+      if (details_vec.size() > 1) {
+        boost::trim(details_vec[1]);
+        if (details_vec[0].find("Revision") != std::string::npos) {
+          r["revision"] = details_vec[1];
+        }
+        extra_items.push_back(details_vec[1]);
+      }
+    }
+    r["extra"] = osquery::join(extra_items, "; ");
+  }
+
+  CFRelease(details);
+  return {r};
 }
 }
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -12,79 +12,17 @@
 
 #include <map>
 #include <mutex>
-#include <vector>
 #include <set>
+#include <utility>
+#include <vector>
 
 #include <boost/noncopyable.hpp>
 #include <boost/property_tree/ptree.hpp>
 
 #include <osquery/core.h>
+#include <osquery/system.h>
 
 namespace osquery {
-
-/**
- * @brief A boilerplate code helper to create a registry given a name and
- * plugin base class type.
- *
- * Registries are types of plugins, e.g., config, logger, table. They are
- * defined with a string name and Plugin derived class. There is an expectation
- * that any 'item' registered will inherit from the registry plugin-derived
- * type. But there is NO type enforcement on that intermediate class.
- *
- * This boilerplate macro puts the registry into a 'registry' namespace for
- * organization and create a global const int that may be instantiated
- * in a header or implementation code without symbol duplication.
- * The initialization is also boilerplate, whereas the Registry::create method
- * (a whole-process-lived single instance object) creates and manages the
- * registry instance.
- *
- * @param type A typename that derives from Plugin.
- * @param name A string identifier for the registry.
- */
-#define CREATE_REGISTRY(type, name)                       \
-  namespace registry {                                    \
-  __registry_constructor__ static void type##Registry() { \
-    Registry::create<type>(name);                         \
-  }                                                       \
-  }
-
-/**
- * @brief A boilerplate code helper to create a registry given a name and
- * plugin base class type. This 'lazy' registry does not run
- * Plugin::setUp on its items, so the registry will do it.
- *
- * @param type A typename that derives from Plugin.
- * @param name A string identifier for the registry.
- */
-#define CREATE_LAZY_REGISTRY(type, name)                  \
-  namespace registry {                                    \
-  __registry_constructor__ static void type##Registry() { \
-    Registry::create<type>(name, true);                   \
-  }                                                       \
-  }
-
-/**
- * @brief A boilerplate code helper to register a plugin.
- *
- * Like CREATE_REGISTRY, REGISTER creates a boilerplate global instance to
- * create an instance of the plugin type within the whole-process-lived registry
- * single instance. Registry items must derive from the `RegistryType` defined
- * by the CREATE_REGISTRY and Registry::create call.
- *
- * @param type A typename that derives from the RegistryType.
- * @param registry The string name for the registry.
- * @param name A string identifier for this registry item.
- */
-#define REGISTER(type, registry, name)                      \
-  __plugin_constructor__ static void type##RegistryItem() { \
-    Registry::add<type>(registry, name);                    \
-  }
-
-/// The same as REGISTER but prevents the plugin item from being broadcasted.
-#define REGISTER_INTERNAL(type, registry, name)             \
-  __plugin_constructor__ static void type##RegistryItem() { \
-    Registry::add<type>(registry, name, true);              \
-  }
 
 /**
  * @brief The request part of a plugin (registry item's) call.
@@ -96,6 +34,7 @@ namespace osquery {
  * each of its plugins.
  */
 using PluginRequest = std::map<std::string, std::string>;
+
 /**
  * @brief The response part of a plugin (registry item's) call.
  *
@@ -106,37 +45,29 @@ using PluginResponse = std::vector<PluginRequest>;
 
 /// Registry routes are a map of item name to each optional PluginReponse.
 using RegistryRoutes = std::map<std::string, PluginResponse>;
+
 /// An extension or core's broadcast includes routes from every Registry.
 using RegistryBroadcast = std::map<std::string, RegistryRoutes>;
 
-using RouteUUID = uint16_t;
+using RouteUUID = uint64_t;
+
 using AddExternalCallback =
     std::function<Status(const std::string&, const PluginResponse&)>;
+
 using RemoveExternalCallback = std::function<void(const std::string&)>;
 
-/// When a module is being initialized its information is kept in a transient
-/// RegistryFactory lookup location.
-struct ModuleInfo {
-  std::string path;
-  std::string name;
-  std::string version;
-  std::string sdk_version;
-};
-
-/// The call-in prototype for Registry modules.
-using ModuleInitalizer = void (*)(void);
-
-template <class PluginItem>
-class PluginFactory {};
+/// The registry includes a single optimization for table generation.
+struct QueryContext;
 
 class Plugin : private boost::noncopyable {
  public:
-  Plugin() : name_("unnamed"){};
-  virtual ~Plugin(){};
+  virtual ~Plugin() = default;
 
  public:
   /// The plugin may perform some initialization, not required.
-  virtual Status setUp() { return Status(0, "Not used"); }
+  virtual Status setUp() {
+    return Status(0, "Not used");
+  }
 
   /// The plugin may perform some tear down, release, not required.
   virtual void tearDown() {}
@@ -145,7 +76,9 @@ class Plugin : private boost::noncopyable {
   virtual void configure() {}
 
   /// The plugin may publish route info (other than registry type and name).
-  virtual PluginResponse routeInfo() const { return PluginResponse(); }
+  virtual PluginResponse routeInfo() const {
+    return PluginResponse();
+  }
 
   /**
    * @brief Plugins act by being called, using a request, returning a response.
@@ -160,24 +93,25 @@ class Plugin : private boost::noncopyable {
    *
    * @return Status of the call, if the action was handled corrected.
    */
-  virtual Status call(const PluginRequest& request, PluginResponse& response) {
-    return Status(0, "Not used");
-  }
+  virtual Status call(const PluginRequest& request,
+                      PluginResponse& response) = 0;
 
   /// Allow the plugin to introspect into the registered name (for logging).
-  void setName(const std::string& name) { name_ = name; }
+  virtual void setName(const std::string& name) final;
 
-  /// Force callsites to use ::getName to access the plugin item's name.
-  virtual const std::string& getName() const { return name_; }
+  /// Force call-sites to use #getName to access the plugin item's name.
+  virtual const std::string& getName() const {
+    return name_;
+  }
 
  public:
-  // Set the output request key to a serialized property tree.
-  // Used by the plugin to set a serialized PluginResponse.
+  /// Set the output request key to a serialized property tree.
+  /// Used by the plugin to set a serialized PluginResponse.
   static void setResponse(const std::string& key,
                           const boost::property_tree::ptree& tree,
                           PluginResponse& response);
 
-  // Get a PluginResponse key as a property tree.
+  /// Get a PluginResponse key as a property tree.
   static void getResponse(const std::string& key,
                           const PluginResponse& response,
                           boost::property_tree::ptree& tree);
@@ -193,25 +127,44 @@ class Plugin : private boost::noncopyable {
    */
   static Status addExternal(const std::string& name,
                             const PluginResponse& info) {
+    (void)name;
+    (void)info;
     return Status(0, "Not used");
   }
 
   /// Allow a specialized plugin type to act when an external plugin is removed.
-  static void removeExternal(const std::string& name) {}
-
- public:
-  Plugin(Plugin const&) = delete;
-  Plugin& operator=(Plugin const&) = delete;
+  static void removeExternal(const std::string& /*name*/) {}
 
  protected:
+  /// Customized name for the plugin, usually set by the registry.
   std::string name_;
 };
 
-class RegistryHelperCore : private boost::noncopyable {
+/// Helper definition for a shared pointer to a Plugin.
+using PluginRef = std::shared_ptr<Plugin>;
+
+/**
+ * @brief This is the registry interface.
+ */
+class RegistryInterface : private boost::noncopyable {
  public:
-  explicit RegistryHelperCore(bool auto_setup = false)
-      : auto_setup_(auto_setup){};
-  virtual ~RegistryHelperCore(){};
+  explicit RegistryInterface(std::string name, bool auto_setup = false)
+      : name_(std::move(name)), auto_setup_(auto_setup) {}
+  virtual ~RegistryInterface() = default;
+
+  /**
+   * @brief This is the only way to add plugins to a registry.
+   *
+   * It must be implemented by the templated child, which knows the type of
+   * registry and which can downcast the input plugin.
+   *
+   * @param plugin_name An indexable name for the plugin.
+   * @param plugin_item A type-specific plugin reference.
+   * @param internal true if this is internal to the osquery SDK.
+   */
+  virtual Status add(const std::string& plugin_name,
+                     const PluginRef& plugin_item,
+                     bool internal = false) = 0;
 
   /**
    * @brief Remove a registry item by its identifier.
@@ -219,6 +172,58 @@ class RegistryHelperCore : private boost::noncopyable {
    * @param item_name An identifier for this registry plugin.
    */
   void remove(const std::string& item_name);
+
+  /// Allow a registry type to react to configuration updates.
+  virtual void configure();
+
+  /// Check if a given plugin name is considered internal.
+  bool isInternal(const std::string& item_name) const;
+
+  /// Allow others to introspect into the routes from extensions.
+  const std::map<std::string, RouteUUID>& getExternal() const {
+    return external_;
+  }
+
+  /// Get the 'active' plugin, return success with the active plugin name.
+  const std::string& getActive() const {
+    return active_;
+  }
+
+  /// Allow others to introspect into the registered name (for reporting).
+  virtual const std::string& getName() const {
+    return name_;
+  }
+
+  /// Facility method to check if a registry item exists.
+  bool exists(const std::string& item_name, bool local = false) const;
+
+  /// Facility method to count the number of items in this registry.
+  size_t count() const {
+    return items_.size();
+  }
+
+  /// Facility method to list the registry item identifiers.
+  std::vector<std::string> names() const;
+
+  /**
+   * @brief Allow a plugin to perform some setup functions when osquery starts.
+   *
+   * Doing work in a plugin constructor has unknown behavior. Plugins may
+   * be constructed at anytime during osquery's life, including global variable
+   * instantiation. To have a reliable state (aka, flags have been parsed,
+   * and logs are ready to stream), do construction work in Plugin::setUp.
+   *
+   * The registry `setUp` will iterate over all of its registry items and call
+   * their setup unless the registry is lazy (see CREATE_REGISTRY).
+   */
+  virtual void setUp();
+
+  virtual PluginRef plugin(const std::string& plugin_name) const = 0;
+
+  /// Construct and return a map of plugin names to their implementation.
+  const std::map<std::string, PluginRef>& plugins() {
+    return items_;
+  }
 
   /**
    * @brief Create a routes table for this registry.
@@ -233,6 +238,7 @@ class RegistryHelperCore : private boost::noncopyable {
    */
   RegistryRoutes getRoutes() const;
 
+ protected:
   /**
    * @brief The only method a plugin user should call.
    *
@@ -253,59 +259,67 @@ class RegistryHelperCore : private boost::noncopyable {
                       const PluginRequest& request,
                       PluginResponse& response);
 
-  /// Insert a named plugin into this registry.
-  Status add(const std::string& item_name, bool internal = false);
+  /**
+   * @brief Add a set of item names broadcasted by an extension uuid.
+   *
+   * When an extension is registered the RegistryFactory will receive a
+   * RegistryBroadcast containing a all of the extension's registry names and
+   * the set of items with their optional route info. The factory depends on
+   * each registry to manage calls/requests to these external plugins.
+   *
+   * @param uuid The uuid chosen for the extension.
+   * @param routes The plugin name and optional route info list.
+   * @return Success if all routes were added, failure if any failed.
+   */
+  Status addExternal(const RouteUUID& uuid, const RegistryRoutes& routes);
 
   /**
-   * @brief Allow a plugin to perform some setup functions when osquery starts.
+   * @brief Each RegistryType will include a trampoline into the PluginType.
    *
-   * Doing work in a plugin constructor has unknown behavior. Plugins may
-   * be constructed at anytime during osquery's life, including global variable
-   * instantiation. To have a reliable state (aka, flags have been parsed,
-   * and logs are ready to stream), do construction work in Plugin::setUp.
+   * A PluginType may act on registry modifications. Each specialized registry
+   * will include a trampoline method to call the plugin type's addExternal.
    *
-   * The registry `setUp` will iterate over all of its registry items and call
-   * their setup unless the registry is lazy (see CREATE_REGISTRY).
+   * @param name Plugin name (not the extension UUID).
+   * @param info The route information broadcasted.
    */
-  virtual void setUp();
+  virtual Status addExternalPlugin(const std::string& name,
+                                   const PluginResponse& info) const = 0;
 
-  /// Allow a registry type to react to configuration updates.
-  virtual void configure();
+  /// Remove all the routes for a given uuid.
+  void removeExternal(const RouteUUID& uuid);
 
-  /// Facility method to check if a registry item exists.
-  bool exists(const std::string& item_name, bool local = false) const;
+  /**
+   * @brief Each RegistryType will include a trampoline into the PluginType.
+   *
+   * A PluginType may act on registry modifications. Each specialized registry
+   * will include a trampoline method to call the plugin type's removeExternal.
+   * @param name Plugin name (not the extension UUID).
+   */
+  virtual void removeExternalPlugin(const std::string& name) const = 0;
+
+  /// Allow the registry to introspect into the registered name (for logging).
+  void setName(const std::string& name) {
+    name_ = name;
+  }
+
+  /**
+   * @brief The implementation adder will call addPlugin.
+   *
+   * Once a downcast is completed the work for adding internal/external
+   * indexes is provided here.
+   */
+  Status addPlugin(const std::string& plugin_name,
+                   const PluginRef& plugin_item,
+                   bool internal);
+
+  /// Set an 'active' plugin to receive registry calls when no item name given.
+  Status setActive(const std::string& item_name);
 
   /// Create a registry item alias for a given item name.
   Status addAlias(const std::string& item_name, const std::string& alias);
 
   /// Get the registry item name for a given alias.
-  const std::string& getAlias(const std::string& alias) const;
-
-  /// Facility method to list the registry item identifiers.
-  std::vector<std::string> names() const;
-
-  /// Facility method to count the number of items in this registry.
-  size_t count() const;
-
-  /// Allow the registry to introspect into the registered name (for logging).
-  void setName(const std::string& name);
-
-  /// Allow others to introspect into the registered name (for reporting).
-  virtual const std::string& getName() const { return name_; }
-
-  /// Check if a given plugin name is considered internal.
-  bool isInternal(const std::string& item_name) const;
-
-  /// Allow others to introspect into the routes from extensions.
-  const std::map<std::string, RouteUUID>& getExternal() const {
-    return external_;
-  }
-
-  /// Set an 'active' plugin to receive registry calls when no item name given.
-  Status setActive(const std::string& item_name);
-
-  /// Get the 'active' plugin, return success with the active plugin name.
-  const std::string& getActive() const;
+  std::string getAlias(const std::string& alias) const;
 
  protected:
   /// The identifier for this registry, used to register items.
@@ -316,7 +330,7 @@ class RegistryHelperCore : private boost::noncopyable {
 
  protected:
   /// A map of registered plugin instances to their registered identifier.
-  std::map<std::string, std::shared_ptr<Plugin> > items_;
+  std::map<std::string, PluginRef> items_;
 
   /// If aliases are used, a map of alias to item name.
   std::map<std::string, std::string> aliases_;
@@ -335,8 +349,8 @@ class RegistryHelperCore : private boost::noncopyable {
   /// be directed to the 'active' plugin.
   std::string active_;
 
-  /// If a module was initialized/declared then store lookup information.
-  std::map<std::string, RouteUUID> modules_;
+ private:
+  friend class RegistryFactory;
 };
 
 /**
@@ -346,85 +360,26 @@ class RegistryHelperCore : private boost::noncopyable {
  * but use a canonical string key for lookups and actions.
  * Registries are created using Registry::create with a RegistryType and key.
  */
-template <class RegistryType>
-class RegistryHelper : public RegistryHelperCore {
+template <class PluginType>
+class RegistryType : public RegistryInterface {
  protected:
-  using RegistryTypeRef = std::shared_ptr<RegistryType>;
+  using PluginTypeRef = std::shared_ptr<PluginType>;
 
  public:
-  explicit RegistryHelper(bool auto_setup = false)
-      : RegistryHelperCore(auto_setup),
-        add_(&RegistryType::addExternal),
-        remove_(&RegistryType::removeExternal){};
-  virtual ~RegistryHelper() {}
+  explicit RegistryType(const std::string& name, bool auto_setup = false)
+      : RegistryInterface(name, auto_setup),
+        add_(&PluginType::addExternal),
+        remove_(&PluginType::removeExternal) {}
+  ~RegistryType() override = default;
 
-  /**
-   * @brief Add a set of item names broadcasted by an extension uuid.
-   *
-   * When an extension is registered the RegistryFactory will receive a
-   * RegistryBroadcast containing a all of the extension's registry names and
-   * the set of items with their optional route info. The factory depends on
-   * each registry to manage calls/requests to these external plugins.
-   *
-   * @param uuid The uuid chosen for the extension.
-   * @param routes The plugin name and optional route info list.
-   * @return Success if all routes were added, failure if any failed.
-   */
-  Status addExternal(const RouteUUID& uuid, const RegistryRoutes& routes) {
-    // Add each route name (item name) to the tracking.
-    for (const auto& route : routes) {
-      // Keep the routes info assigned to the registry.
-      routes_[route.first] = route.second;
-      auto status = add_(route.first, route.second);
-      external_[route.first] = uuid;
-      if (!status.ok()) {
-        return status;
-      }
+  Status add(const std::string& plugin_name,
+             const PluginRef& plugin_item,
+             bool internal = false) override {
+    if (nullptr == std::dynamic_pointer_cast<PluginType>(plugin_item)) {
+      throw std::runtime_error("Cannot add foreign plugin type: " +
+                               plugin_name);
     }
-    return Status(0, "OK");
-  }
-
-  /// Remove all the routes for a given uuid.
-  void removeExternal(const RouteUUID& uuid) {
-    std::vector<std::string> removed_items;
-    for (const auto& item : external_) {
-      if (item.second == uuid) {
-        remove_(item.first);
-        removed_items.push_back(item.first);
-      }
-    }
-
-    // Remove items belonging to the external uuid.
-    for (const auto& item : removed_items) {
-      external_.erase(item);
-      routes_.erase(item);
-    }
-  }
-
-  /**
-   * @brief Add a plugin to this registry by allocating and indexing
-   * a type Item and a key identifier.
-   *
-   * @code{.cpp}
-   *   /// Instead of calling RegistryFactory::add use:
-   *   REGISTER(Type, "registry_name", "item_name");
-   * @endcode
-   *
-   * @param item_name An identifier for this registry plugin.
-   * @return A success/failure status.
-   */
-  template <class Item>
-  Status add(const std::string& item_name, bool internal = false) {
-    if (items_.count(item_name) > 0) {
-      return Status(1, "Duplicate registry item exists: " + item_name);
-    }
-
-    // Cast the specific registry-type derived item as the API type of the
-    // registry used when created using the registry factory.
-    std::shared_ptr<RegistryType> item((RegistryType*)new Item());
-    item->setName(item_name);
-    items_[item_name] = item;
-    return RegistryHelperCore::add(item_name, internal);
+    return addPlugin(plugin_name, plugin_item, internal);
   }
 
   /**
@@ -433,170 +388,45 @@ class RegistryHelper : public RegistryHelperCore {
    * If there is no plugin with an item_name identifier this will throw
    * and out_of_range exception.
    *
-   * @param item_name An identifier for this registry plugin.
+   * @param plugin_name An identifier for this registry plugin.
    * @return A std::shared_ptr of type RegistryType.
    */
-  RegistryTypeRef get(const std::string& item_name) const {
-    return std::dynamic_pointer_cast<RegistryType>(items_.at(item_name));
-  }
-
-  const std::map<std::string, RegistryTypeRef> all() const {
-    std::map<std::string, RegistryTypeRef> ditems;
-    for (const auto& item : items_) {
-      ditems[item.first] = std::dynamic_pointer_cast<RegistryType>(item.second);
+  PluginRef plugin(const std::string& plugin_name) const override {
+    if (items_.count(plugin_name) == 0) {
+      return nullptr;
     }
-
-    return ditems;
+    return items_.at(plugin_name);
   }
 
- public:
-  RegistryHelper(RegistryHelper const&) = delete;
-  void operator=(RegistryHelper const&) = delete;
+  /// Trampoline function for calling the PluginType's addExternal.
+  Status addExternalPlugin(const std::string& name,
+                           const PluginResponse& info) const override {
+    return add_(name, info);
+  }
+
+  /// Trampoline function for calling the PluginType's removeExternal.
+  void removeExternalPlugin(const std::string& name) const override {
+    remove_(name);
+  }
 
  private:
   AddExternalCallback add_;
   RemoveExternalCallback remove_;
+
+ private:
+  FRIEND_TEST(EventsTests, test_event_subscriber_configure);
+  FRIEND_TEST(VirtualTableTests, test_indexing_costs);
 };
 
-/// Helper defintion for a shared pointer to a Plugin.
-using PluginRef = std::shared_ptr<Plugin>;
-/// Helper definition for a basic-templated Registry type using a base Plugin.
-using PluginRegistryHelper = RegistryHelper<Plugin>;
 /// Helper definitions for a shared pointer to the basic Registry type.
-using PluginRegistryHelperRef = std::shared_ptr<PluginRegistryHelper>;
-
-/**
- * @basic A workflow manager for opening a module path and appending to the
- * core registry.
- *
- * osquery Registry modules are part of the extensions API, in that they use
- * the osquery SDK to expose additional features to the osquery core. Modules
- * do not require the Thrift interface and may be compiled as shared objects
- * and loaded late at run time once the core and internal registry has been
- * initialized and setUp.
- *
- * A ModuleLoader interprets search paths, dynamically loads the modules,
- * maintains identification within the RegistryFactory and any registries
- * the module adds items into.
- */
-class RegistryModuleLoader : private boost::noncopyable {
- public:
-  /// Unlock the registry, open, construct, and allow the module to declare.
-  explicit RegistryModuleLoader(const std::string& path);
-
-  /// Clear module information, 'lock' the registry.
-  ~RegistryModuleLoader();
-
-  /// Keep the symbol resolution/calling out of construction.
-  void init();
-
- private:
-  // Keep the handle for symbol resolution/calling.
-  void* handle_{nullptr};
-
-  // Keep the path for debugging/logging.
-  std::string path_;
-
- private:
-  FRIEND_TEST(RegistryTests, test_registry_modules);
-};
+using RegistryInterfaceRef = std::shared_ptr<RegistryInterface>;
 
 class RegistryFactory : private boost::noncopyable {
  public:
-  static RegistryFactory& instance() {
+  static RegistryFactory& get() {
     static RegistryFactory instance;
     return instance;
   };
-
-  /**
-   * @brief Create a registry using a plugin type and identifier.
-   *
-   * A short hard for allocating a new registry type a RegistryHelper and
-   * plugin derived class Type or RegistryType. This shorthand performs
-   * the allocation and initialization of the Type and keeps the instance
-   * identified by registry_name.
-   *
-   * @code{.cpp}
-   *   /// Instead of calling RegistryFactory::create use:
-   *   CREATE_REGISTRY(Type, "registry_name");
-   * @endcode
-   *
-   * @param registry_name The canonical name for this registry.
-   * @param auto_setup Set true if the registry does not setup itself
-   * @return A non-sense int that must be casted const.
-   */
-  template <class Type>
-  static int create(const std::string& registry_name, bool auto_setup = false) {
-    if (locked() || instance().registries_.count(registry_name) > 0) {
-      return 0;
-    }
-
-    PluginRegistryHelperRef registry(
-        (PluginRegistryHelper*)new RegistryHelper<Type>(auto_setup));
-    registry->setName(registry_name);
-    instance().registries_[registry_name] = registry;
-    return 0;
-  }
-
-  /// Direct access to a registry instance.
-  static PluginRegistryHelperRef registry(const std::string& registry_name);
-
-  /**
-   * @brief Add (implies create) a Plugin to a registry.
-   *
-   * REGISTER and REGISTER_INTERNAL are helper macros for `add` usage.
-   *
-   * @code{.cpp}
-   *  /// Instead of calling RegistryFactor::add use:
-   *  REGISTER(Type, "registry_name", "plugin_name");
-   * @endcode
-   *
-   * @param registry_name The canonical name for this registry.
-   * @param item_name The canonical name for this plugin. Specific registries
-   * may apply specialized use of the plugin name, such as table.
-   * @param internal True if this plugin should not be broadcasted externally.
-   */
-  template <class Item>
-  static Status add(const std::string& registry_name,
-                    const std::string& item_name,
-                    bool internal = false) {
-    if (!locked()) {
-      auto registry = instance().registry(registry_name);
-      return registry->template add<Item>(item_name, internal);
-    }
-    return Status(0, "Registry locked");
-  }
-
-  /// Direct access to all registries.
-  static const std::map<std::string, PluginRegistryHelperRef>& all();
-
-  /// Direct access to all plugin instances for a given registry name.
-  static const std::map<std::string, PluginRef> all(
-      const std::string& registry_name);
-
-  /// Direct access to a plugin instance.
-  static PluginRef get(const std::string& registry_name,
-                       const std::string& item_name);
-
-  /// Serialize this core or extension's registry.
-  static RegistryBroadcast getBroadcast();
-
-  /// Add external registry items identified by a Route UUID.
-  static Status addBroadcast(const RouteUUID& uuid,
-                             const RegistryBroadcast& broadcast);
-
-  /// Given an extension UUID remove all external registry items.
-  static Status removeBroadcast(const RouteUUID& uuid);
-
-  /// Adds an alias for an internal registry item. This registry will only
-  /// broadcast the alias name.
-  static Status addAlias(const std::string& registry_name,
-                         const std::string& item_name,
-                         const std::string& alias);
-
-  /// Returns the item_name or the item alias if an alias exists.
-  static const std::string& getAlias(const std::string& registry_name,
-                                     const std::string& alias);
 
   /**
    * @brief Call a registry item.
@@ -637,89 +467,114 @@ class RegistryFactory : private boost::noncopyable {
   static Status call(const std::string& registry_name,
                      const PluginRequest& request);
 
-  /// Set a registry's active plugin.
-  static Status setActive(const std::string& registry_name,
-                          const std::string& item_name);
-
-  /// Get a registry's active plugin.
-  static const std::string& getActive(const std::string& registry_nane);
-
   /// Run `setUp` on every registry that is not marked 'lazy'.
   static void setUp();
 
+ public:
+  /// Direct access to a registry instance.
+  RegistryInterfaceRef registry(const std::string& registry_name) const;
+
+  void add(const std::string& name, RegistryInterfaceRef reg);
+
+  /// Direct access to all registries.
+  std::map<std::string, RegistryInterfaceRef> all() const;
+
+  /// Direct access to all plugin instances for a given registry name.
+  std::map<std::string, PluginRef> plugins(
+      const std::string& registry_name) const;
+
+  /// Direct access to a plugin instance.
+  PluginRef plugin(const std::string& registry_name,
+                   const std::string& item_name) const;
+
+  /// Serialize this core or extension's registry.
+  RegistryBroadcast getBroadcast();
+
+  /// Add external registry items identified by a Route UUID.
+  Status addBroadcast(const RouteUUID& uuid,
+                      const RegistryBroadcast& broadcast);
+
+  /// Given an extension UUID remove all external registry items.
+  Status removeBroadcast(const RouteUUID& uuid);
+
+  /// Adds an alias for an internal registry item. This registry will only
+  /// broadcast the alias name.
+  Status addAlias(const std::string& registry_name,
+                  const std::string& item_name,
+                  const std::string& alias);
+
+  /// Returns the item_name or the item alias if an alias exists.
+  std::string getAlias(const std::string& registry_name,
+                       const std::string& alias) const;
+
+  /// Set a registry's active plugin.
+  Status setActive(const std::string& registry_name,
+                   const std::string& item_name);
+
+  /// Get a registry's active plugin.
+  std::string getActive(const std::string& registry_nane) const;
+
+  bool exists(const std::string& registry_name) const {
+    return (registries_.count(registry_name) > 0);
+  }
+
   /// Check if a registry item exists, optionally search only local registries.
-  static bool exists(const std::string& registry_name,
-                     const std::string& item_name,
-                     bool local = false);
+  bool exists(const std::string& registry_name,
+              const std::string& item_name,
+              bool local = false) const;
 
   /// Get a list of the registry names.
-  static std::vector<std::string> names();
+  std::vector<std::string> names() const;
 
   /// Get a list of the registry item names for a given registry.
-  static std::vector<std::string> names(const std::string& registry_name);
+  std::vector<std::string> names(const std::string& registry_name) const;
 
   /// Get a list of the registered extension UUIDs.
-  static std::vector<RouteUUID> routeUUIDs();
+  std::vector<RouteUUID> routeUUIDs() const;
 
   /// Return the number of registries.
-  static size_t count();
+  size_t count() const {
+    return registries_.size();
+  }
 
   /// Return the number of registry items for a given registry name.
-  static size_t count(const std::string& registry_name);
+  size_t count(const std::string& registry_name) const;
 
   /// Enable/disable duplicate registry item support using aliasing.
-  static void allowDuplicates(bool allow) {
-    instance().allow_duplicates_ = allow;
+  void allowDuplicates(bool allow) {
+    allow_duplicates_ = allow;
   }
 
   /// Check if duplicate registry items using registry aliasing are allowed.
-  static bool allowDuplicates() { return instance().allow_duplicates_; }
-
-  /// Declare a module for initialization and subsequent registration attempts
-  static void declareModule(const std::string& name,
-                            const std::string& version,
-                            const std::string& min_sdk_version,
-                            const std::string& sdk_version);
-
-  /// Access module metadata.
-  static const std::map<RouteUUID, ModuleInfo>& getModules();
+  bool allowDuplicates() {
+    return allow_duplicates_;
+  }
 
   /// Set the registry external (such that internal events are forwarded).
   /// Once set external, it should not be unset.
-  static void setExternal() { instance().external_ = true; }
+  void setExternal() {
+    external_ = true;
+  }
 
   /// Get the registry external status.
-  static bool external() { return instance().external_; }
+  bool external() {
+    return external_;
+  }
 
  private:
-  /// Access the current initializing module UUID.
-  static RouteUUID getModule();
-
-  /// Check if the registry is allowing module registrations.
-  static bool usingModule();
-
-  /// Initialize a module for lookup, resolution, and its registrations.
-  static void initModule(const std::string& path);
-
-  static void shutdownModule();
-
   /// Check if the registries are locked.
-  static bool locked() { return instance().locked_; }
+  bool locked() {
+    return locked_;
+  }
 
   /// Set the registry locked status.
-  static void locked(bool locked) { instance().locked_ = locked; }
-
- public:
-  RegistryFactory(RegistryFactory const&) = delete;
-  RegistryFactory& operator=(RegistryFactory const&) = delete;
+  void locked(bool locked) {
+    locked_ = locked;
+  }
 
  protected:
-  RegistryFactory()
-      : allow_duplicates_(false),
-        locked_(false),
-        module_uuid_(0),
-        external_(false) {}
-  virtual ~RegistryFactory() {}
+  RegistryFactory() = default;
+  virtual ~RegistryFactory() = default;
 
  private:
   /// Track duplicate registry item support, used for testing.
@@ -729,7 +584,7 @@ class RegistryFactory : private boost::noncopyable {
   bool locked_{false};
 
   /// The primary storage for constructed registries.
-  std::map<std::string, PluginRegistryHelperRef> registries_;
+  std::map<std::string, RegistryInterfaceRef> registries_;
 
   /**
    * @brief The registry tracks the set of active extension routes.
@@ -741,26 +596,15 @@ class RegistryFactory : private boost::noncopyable {
    */
   std::set<RouteUUID> extensions_;
 
-  /**
-   * @brief The registry tracks loaded extension module metadata/info.
-   *
-   * Each extension module is assigned a transient RouteUUID for identification
-   * those route IDs are passed to each registry to identify which plugin
-   * items belong to modules, similarly to extensions.
-   */
-  std::map<RouteUUID, ModuleInfo> modules_;
-
-  /// During module initialization store the current-working module ID.
-  RouteUUID module_uuid_{0};
-
   /// Calling startExtension should declare the registry external.
   /// This will cause extension-internal events to forward to osquery core.
   bool external_{false};
 
+  /// Protector for broadcast lookups and external registry mutations.
+  mutable Mutex mutex_;
+
  private:
-  friend class RegistryHelperCore;
-  friend class RegistryModuleLoader;
-  FRIEND_TEST(RegistryTests, test_registry_modules);
+  friend class RegistryInterface;
 };
 
 /**
@@ -773,5 +617,113 @@ class RegistryFactory : private boost::noncopyable {
  * The actual plugins must add themselves to a registry type and should
  * implement the Plugin and RegistryType interfaces.
  */
-class Registry : public RegistryFactory {};
-}
+using Registry = RegistryFactory;
+
+class AutoRegisterInterface;
+using AutoRegisterSet = std::vector<std::unique_ptr<AutoRegisterInterface>>;
+
+class AutoRegisterInterface {
+ public:
+  /// The registry name, or type identifier.
+  std::string type_;
+
+  /// The registry or plugin name.
+  std::string name_;
+
+  /// Either autoload a registry, or create an internal plugin.
+  bool optional_;
+
+  AutoRegisterInterface(const char* _type, const char* _name, bool optional)
+      : type_(_type), name_(_name), optional_(optional) {}
+  virtual ~AutoRegisterInterface() = default;
+
+  /// A call-in for the iterator.
+  virtual void run() = 0;
+
+ public:
+  /// Access all registries.
+  static AutoRegisterSet& registries() {
+    static AutoRegisterSet registries_;
+    return registries_;
+  }
+
+  /// Insert a new registry.
+  static void autoloadRegistry(std::unique_ptr<AutoRegisterInterface> ar_) {
+    registries().push_back(std::move(ar_));
+  }
+
+  /// Access all plugins.
+  static AutoRegisterSet& plugins() {
+    static AutoRegisterSet plugins_;
+    return plugins_;
+  }
+
+  /// Insert a new plugin.
+  static void autoloadPlugin(std::unique_ptr<AutoRegisterInterface> ar_) {
+    plugins().push_back(std::move(ar_));
+  }
+};
+
+namespace registries {
+
+template <class R>
+class AR : public AutoRegisterInterface {
+ public:
+  AR(const char* t, const char* n, bool optional)
+      : AutoRegisterInterface(t, n, optional) {}
+
+  void run() override {
+    RegistryFactory::get().add(
+        type_, std::make_shared<RegistryType<R>>(name_, optional_));
+  }
+};
+
+template <class P>
+class AP : public AutoRegisterInterface {
+ public:
+  AP(const char* t, const char* n, bool optional)
+      : AutoRegisterInterface(t, n, optional) {}
+
+  void run() override {
+    auto registry = RegistryFactory::get().registry(type_);
+    registry->add(name_, std::make_shared<P>(), optional_);
+  }
+};
+
+template <class R>
+struct RI {
+  RI(const char* t, const char* n, bool o = false) {
+    AutoRegisterInterface::autoloadRegistry(std::make_unique<AR<R>>(t, n, o));
+  }
+};
+
+template <class P>
+struct PI {
+  PI(const char* t, const char* n, bool o = false) {
+    AutoRegisterInterface::autoloadPlugin(std::make_unique<AP<P>>(t, n, o));
+  }
+};
+} // namespace registries
+
+#define CREATE_REGISTRY(t, n)                                                  \
+  namespace registries {                                                       \
+  const RI<t> k##t(n, n, false);                                               \
+  }
+
+#define CREATE_LAZY_REGISTRY(t, n)                                             \
+  namespace registries {                                                       \
+  const RI<t> k##t(n, n, true);                                                \
+  }
+
+#define REGISTER(t, r, n)                                                      \
+  namespace registries {                                                       \
+  const PI<t> k##t(r, n, false);                                               \
+  }
+
+#define REGISTER_INTERNAL(t, r, n)                                             \
+  namespace registries {                                                       \
+  const PI<t> k##t(r, n, true);                                                \
+  }
+
+void registryAndPluginInit();
+} // namespace osquery

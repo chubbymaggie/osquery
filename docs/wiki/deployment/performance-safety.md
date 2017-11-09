@@ -12,27 +12,27 @@ Consider the following `osquery.conf`:
 {
   "schedule": {
     "alf_services": {
-      "query": "select service, process from alf_services where state != 0;",
+      "query": "SELECT service, process FROM alf_services WHERE state != 0;",
       "interval": 60
     },
     "installed_applications": {
-      "query": "select name, path, bundle_version, minimum_system_version, applescript_enabled, bundle_executable from apps;",
+      "query": "SELECT name, path, bundle_version, minimum_system_version, applescript_enabled, bundle_executable FROM apps;",
       "interval": 60
     },
     "all_kexts": {
-      "query": "select name, version from kernel_extensions;",
+      "query": "SELECT name, version FROM kernel_extensions;",
       "interval": 60
     },
     "non_apple_kexts": {
-      "query": "select * from kernel_extensions where name not like 'com.apple.%' and name != '__kernel__';",
+      "query": "SELECT * FROM kernel_extensions WHERE name NOT LIKE 'com.apple.%' AND name != '__kernel__';",
       "interval": 60
     },
     "processes_binding_to_ports": {
-      "query": "select distinct process.name, listening.port, listening.protocol, listening.family, listening.address, process.pid, process.path, process.on_disk, process.parent, process.start_time from processes as process join listening_ports as listening on process.pid = listening.pid;",
+      "query": "SELECT DISTINCT process.name, listening.port, listening.protocol, listening.family, listening.address, process.pid, process.path, process.on_disk, process.parent, process.start_time FROM processes AS process JOIN listening_ports AS listening ON process.pid = listening.pid;",
       "interval": 60
     },
     "processes_not_on_disk": {
-      "query": "select * from processes where on_disk != 1;",
+      "query": "SELECT * FROM processes WHERE on_disk != 1;",
       "interval": 60
     }
   }
@@ -41,27 +41,29 @@ Consider the following `osquery.conf`:
 
 Each query provides useful information and will run every minute. But what sort of impact will this have on the client machines?
 
-For this we can use `./tools/profile.py` to profile the queries by running them for a configured number of rounds and reporting the pre-defined performance category of each. A higher category result means higher impact. High impact queries should be avoided, but if the information is valuable, consider running them less-often.
+For this we can use `./tools/analysis/profile.py` to profile the queries by running them for a configured number of rounds and reporting the pre-defined performance category of each. A higher category result means higher impact. High impact queries should be avoided, but if the information is valuable, consider running them less-often.
 
 ```
-$ sudo -E python ./tools/profile.py --config osquery.conf
-Profiling query: select * from kernel_extensions where name not like 'com.apple.%' and name != '__kernel__';
+$ sudo -E python ./tools/analysis/profile.py --config osquery.conf
+Profiling query: SELECT * FROM kernel_extensions WHERE name NOT LIKE 'com.apple.%' AND name != '__kernel__';
  D:0  C:0  M:0  F:0  U:1  non_apple_kexts (1/1): duration: 0.519426107407 cpu_time: 0.096729864 memory: 6447104 fds: 5 utilization: 9.5
-Profiling query: select name, path, bundle_version, minimum_system_version, applescript_enabled, bundle_executable from apps;
+Profiling query: SELECT name, path, bundle_version, minimum_system_version, applescript_enabled, bundle_executable FROM apps;
  D:0  C:0  M:0  F:0  U:1  installed_applications (1/1): duration: 0.507317066193 cpu_time: 0.113432314 memory: 7639040 fds: 6 utilization: 11.15
-Profiling query: select service, process from alf_services where state != 0;
+Profiling query: SELECT service, process FROM alf_services WHERE state != 0;
  D:0  C:0  M:0  F:0  U:0  alf_services (1/1): duration: 0.525090932846 cpu_time: 0.021108868 memory: 5406720 fds: 5 utilization: 1.9
-Profiling query: select * from processes where on_disk != 1;
+Profiling query: SELECT * FROM processes WHERE on_disk != 1;
  D:0  C:0  M:0  F:0  U:0  processes_not_on_disk (1/1): duration: 0.521270990372 cpu_time: 0.030440911 memory: 6148096 fds: 5 utilization: 2.8
-Profiling query: select name, version from kernel_extensions;
+Profiling query: SELECT name, version FROM kernel_extensions;
  D:0  C:0  M:0  F:0  U:1  all_kexts (1/1): duration: 0.522475004196 cpu_time: 0.089579066 memory: 6500352 fds: 5 utilization: 8.65
-Profiling query: select distinct process.name, listening.port, listening.protocol, listening.family, listening.address, process.pid, process.path, process.on_disk, process.parent, process.start_time from processes as process join listening_ports as listening on process.pid = listening.pid;
+Profiling query: SELECT DISTINCT process.name, listening.port, listening.protocol, listening.family, listening.address, process.pid, process.path, process.on_disk, process.parent, process.start_time FROM processes AS process JOIN listening_ports AS listening ON process.pid = listening.pid;
  D:2  C:1  M:0  F:0  U:2  processes_binding_to_ports (1/1): duration: 1.02116107941 cpu_time: 0.668809664 memory: 6340608 fds: 5 utilization: 44.3
 ```
 
 The results (utilization=2) suggest running `processes_binding_to_ports` less often.
 
 To estimate how often these should run you should evaluate what a differential in the information means from your visibility requirement's perspective (how meaningful is a change vs. how often you check for the change). Then weigh that value against the performance impact of running the query.
+
+Queries that fail to execute (for example, due to a non-existent table) will return the highest category result '3' and the value '-1' for all statistics. 
 
 ## Continuous Build
 
@@ -70,8 +72,8 @@ The continuous integration for osquery is currently under development. The previ
 The build will run each of the support operating system platform/versions and include the following phases:
 
 * Build and run `make test`
-* Attempt to detect memory leaks using `./tools/profile.py --leaks`
-* Run a performance measurement using `./tools/profile.py`
+* Attempt to detect memory leaks using `./tools/analysis/profile.py --leaks`
+* Run a performance measurement using `./tools/analysis/profile.py`
 * Check performance against the latest release tag and commit to master
 * Build docs and API spec on release tag or commit to master
 
@@ -92,7 +94,7 @@ For your build iteration.
 Before deploying an osquery config use:
 
 ```
-./tools/profile.py --config /path/to/osquery.conf --count 1 --rounds 4
+./tools/analysis/profile.py --config /path/to/osquery.conf --count 1 --rounds 4
 ```
 
 To estimate the amount of CPU/memory load the system will incur for each query.

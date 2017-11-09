@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
@@ -37,8 +37,6 @@ RESERVED = ["n", "index"]
 PLATFORM = platform()
 
 # Supported SQL types for spec
-
-
 class DataType(object):
     def __init__(self, affinity, cpp_type="std::string"):
         '''A column datatype is a pair of a SQL affinity to C++ type.'''
@@ -66,11 +64,49 @@ NETWORK = "NETWORK"
 EVENTS = "EVENTS"
 APPLICATION = "APPLICATION"
 
+# This should mimic the C++ enumeration ColumnOptions in table.h
+COLUMN_OPTIONS = {
+    "index": "INDEX",
+    "additional": "ADDITIONAL",
+    "required": "REQUIRED",
+    "optimized": "OPTIMIZED",
+    "hidden": "HIDDEN",
+}
 
-def usage():
-    """ print program usage """
-    print(
-        "Usage: %s <spec.table> <file.cpp> [disable_blacklist]" % sys.argv[0])
+# Column options that render tables uncacheable.
+NON_CACHEABLE = [
+    "REQUIRED",
+    "ADDITIONAL",
+    "OPTIMIZED",
+]
+
+TABLE_ATTRIBUTES = {
+    "event_subscriber": "EVENT_BASED",
+    "user_data": "USER_BASED",
+    "cacheable": "CACHEABLE",
+    "utility": "UTILITY",
+    "kernel_required": "KERNEL_REQUIRED",
+}
+
+
+def WINDOWS():
+    return PLATFORM in ['windows', 'win32', 'cygwin']
+
+
+def LINUX():
+    return PLATFORM in ['linux']
+
+
+def POSIX():
+    return PLATFORM in ['linux', 'darwin', 'freebsd']
+
+
+def DARWIN():
+    return PLATFORM in ['darwin']
+
+
+def FREEBSD():
+    return PLATFORM in ['freebsd']
 
 
 def to_camel_case(snake_case):
@@ -88,7 +124,7 @@ def is_blacklisted(table_name, path=None, blacklist=None):
     if blacklist is None:
         specs_path = os.path.dirname(path)
         if os.path.basename(specs_path) != "specs":
-            specs_path = os.path.basename(specs_path)
+            specs_path = os.path.dirname(specs_path)
         blacklist_path = os.path.join(specs_path, "blacklist")
         if not os.path.exists(blacklist_path):
             return False
@@ -162,6 +198,11 @@ class TableState(Singleton):
         self.description = ""
         self.attributes = {}
         self.examples = []
+        self.aliases = []
+        self.fuzz_paths = []
+        self.has_options = False
+        self.has_column_aliases = False
+        self.generator = False
 
     def columns(self):
         return [i for i in self.schema if isinstance(i, Column)]
@@ -172,25 +213,31 @@ class TableState(Singleton):
     def generate(self, path, template="default"):
         """Generate the virtual table files"""
         logging.debug("TableState.generate")
-        self.impl_content = jinja2.Template(TEMPLATES[template]).render(
-            table_name=self.table_name,
-            table_name_cc=to_camel_case(self.table_name),
-            schema=self.columns(),
-            header=self.header,
-            impl=self.impl,
-            function=self.function,
-            class_name=self.class_name,
-            attributes=self.attributes,
-            examples=self.examples,
-        )
 
-        column_options = []
+        all_options = []
+        # Create a list of column options from the kwargs passed to the column.
         for column in self.columns():
-            column_options += column.options
-        non_cachable = ["index", "required", "additional", "superuser"]
-        if "cachable" in self.attributes:
-            if len(set(column_options).intersection(non_cachable)) > 0:
-                print(lightred("Table cannot be marked cachable: %s" % (path)))
+            column_options = []
+            for option in column.options:
+                # Only allow explicitly-defined options.
+                if option in COLUMN_OPTIONS:
+                    column_options.append("ColumnOptions::" + COLUMN_OPTIONS[option])
+                    all_options.append(COLUMN_OPTIONS[option])
+                else:
+                    print(yellow(
+                        "Table %s column %s contains an unknown option: %s" % (
+                            self.table_name, column.name, option)))
+            column.options_set = " | ".join(column_options)
+            if len(column.aliases) > 0:
+                self.has_column_aliases = True
+        if len(all_options) > 0:
+            self.has_options = True
+        if "event_subscriber" in self.attributes:
+            self.generator = True
+        if "cacheable" in self.attributes:
+            if self.generator:
+                print(lightred(
+                    "Table cannot use a generator and be marked cacheable: %s" % (path)))
                 exit(1)
         if self.table_name == "" or self.function == "":
             print(lightred("Invalid table spec: %s" % (path)))
@@ -202,6 +249,13 @@ class TableState(Singleton):
                 print(lightred(("Cannot use column name: %s in table: %s "
                                 "(the column name is reserved)" % (
                                     column.name, self.table_name))))
+                exit(1)
+
+        if "ADDITIONAL" in all_options and "INDEX" not in all_options:
+            if "no_pkey" not in self.attributes:
+                print(lightred(
+                    "Table cannot have 'additional' columns without an index: %s" %(
+                    path)))
                 exit(1)
 
         path_bits = path.split("/")
@@ -216,6 +270,23 @@ class TableState(Singleton):
                     # May encounter a race when using a make jobserver.
                     pass
         logging.debug("generating %s" % path)
+        self.impl_content = jinja2.Template(TEMPLATES[template]).render(
+            table_name=self.table_name,
+            table_name_cc=to_camel_case(self.table_name),
+            schema=self.columns(),
+            header=self.header,
+            impl=self.impl,
+            function=self.function,
+            class_name=self.class_name,
+            attributes=self.attributes,
+            examples=self.examples,
+            aliases=self.aliases,
+            has_options=self.has_options,
+            has_column_aliases=self.has_column_aliases,
+            generator=self.generator,
+            attribute_set=[TABLE_ATTRIBUTES[attr] for attr in self.attributes if attr in TABLE_ATTRIBUTES],
+        )
+
         with open(path, "w+") as file_h:
             file_h.write(self.impl_content)
 
@@ -235,10 +306,11 @@ class Column(object):
     documentation generation and reference.
     """
 
-    def __init__(self, name, col_type, description="", **kwargs):
+    def __init__(self, name, col_type, description="", aliases=[], **kwargs):
         self.name = name
         self.type = col_type
         self.description = description
+        self.aliases = aliases
         self.options = kwargs
 
 
@@ -254,7 +326,7 @@ class ForeignKey(object):
         self.table = kwargs.get("table", "")
 
 
-def table_name(name):
+def table_name(name, aliases=[]):
     """define the virtual table name"""
     logging.debug("- table_name")
     logging.debug("  - called with: %s" % name)
@@ -262,6 +334,7 @@ def table_name(name):
     table.description = ""
     table.attributes = {}
     table.examples = []
+    table.aliases = aliases
 
 
 def schema(schema_list):
@@ -278,7 +351,23 @@ def schema(schema_list):
     table.schema = schema_list
 
 
+def extended_schema(check, schema_list):
+    """
+    define a comparator and a list of Columns objects.
+    """
+    logging.debug("- extended schema")
+    for it in schema_list:
+        if isinstance(it, Column):
+            logging.debug("  - column: %s (%s)" % (it.name, it.type))
+            if not check():
+                it.options['hidden'] = True
+            table.schema.append(it)
+
+
 def description(text):
+    if text[-1:] != '.':
+        print(lightred("Table description must end with a period!"))
+        exit(1)
     table.description = text
 
 
@@ -297,7 +386,11 @@ def attributes(**kwargs):
         table.attributes[attr] = kwargs[attr]
 
 
-def implementation(impl_string):
+def fuzz_paths(paths):
+    table.fuzz_paths = paths
+
+
+def implementation(impl_string, generator=False):
     """
     define the path to the implementation file and the function which
     implements the virtual table. You should use the following format:
@@ -318,9 +411,13 @@ def implementation(impl_string):
     table.impl = impl
     table.function = function
     table.class_name = class_name
+    table.generator = generator
 
     '''Check if the table has a subscriber attribute, if so, enforce time.'''
     if "event_subscriber" in table.attributes:
+        if not table.table_name.endswith("_events"):
+            print(lightred("Event subscriber must use a '_events' suffix"))
+            sys.exit(1)
         columns = {}
         # There is no dictionary comprehension on all supported platforms.
         for column in table.schema:
@@ -344,6 +441,10 @@ def main(argc, argv):
         "--debug", default=False, action="store_true",
         help="Output debug messages (when developing)"
     )
+    parser.add_argument("--disable-blacklist", default=False,
+        action="store_true")
+    parser.add_argument("--foreign", default=False, action="store_true",
+        help="Generate a foreign table")
     parser.add_argument("--templates", default=SCRIPT_DIR + "/templates",
                         help="Path to codegen output .cpp.in templates")
     parser.add_argument("spec_file", help="Path to input .table spec file")
@@ -355,25 +456,21 @@ def main(argc, argv):
     else:
         logging.basicConfig(format=LOG_FORMAT, level=logging.INFO)
 
-    if argc < 3:
-        usage()
-        sys.exit(1)
     filename = args.spec_file
     output = args.output
-
     if filename.endswith(".table"):
         # Adding a 3rd parameter will enable the blacklist
-        disable_blacklist = argc > 3
 
         setup_templates(args.templates)
         with open(filename, "rU") as file_handle:
             tree = ast.parse(file_handle.read())
             exec(compile(tree, "<string>", "exec"))
             blacklisted = is_blacklisted(table.table_name, path=filename)
-            if not disable_blacklist and blacklisted:
+            if not args.disable_blacklist and blacklisted:
                 table.blacklist(output)
             else:
-                table.generate(output)
+                template_type = "default" if not args.foreign else "foreign"
+                table.generate(output, template=template_type)
 
 if __name__ == "__main__":
     SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))

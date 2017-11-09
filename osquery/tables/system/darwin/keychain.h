@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -7,6 +7,8 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
+
+#pragma once
 
 #include <map>
 #include <set>
@@ -27,16 +29,6 @@
 
 #include "osquery/core/conversions.h"
 
-// If using the system-provided OpenSSL on 10.10, mark x509 methods deprecated.
-#ifdef SSL_TXT_TLSV1_2
-#define OSX_OPENSSL(expr) \
-  do {                    \
-    expr;                 \
-  } while (0)
-#else
-#define OSX_OPENSSL(expr) OSQUERY_USE_DEPRECATED(expr)
-#endif
-
 namespace osquery {
 namespace tables {
 
@@ -46,7 +38,7 @@ extern const std::vector<std::string> kUserKeychainPaths;
 // The flags are defined in openssl/x509v3.h,
 // and its keys in crypto/x509v3/v3_bitst.c
 // clang-format off
-const std::map<unsigned long, std::string> kKeyUsageFlags = {
+const std::map<uint32_t, std::string> kKeyUsageFlags = {
     {0x0001, "Encipher Only"},
     {0x0002, "CRL Sign"},
     {0x0004, "Key Cert Sign"},
@@ -77,7 +69,7 @@ void genCommonName(X509* cert,
                    std::string& issuer);
 time_t genEpoch(ASN1_TIME* time);
 
-std::string genSHA1ForCertificate(const CFDataRef& raw_cert);
+std::string genSHA1ForCertificate(X509* cert);
 bool CertificateIsCA(X509* cert);
 bool CertificateIsSelfSigned(X509* cert);
 
@@ -86,7 +78,7 @@ CFArrayRef CreateKeychainItems(const std::set<std::string>& paths,
                                const CFTypeRef& item_type);
 
 std::set<std::string> getKeychainPaths();
-std::string genKeyUsage(unsigned long flag);
+std::string genKeyUsage(uint32_t flag);
 std::string genHumanReadableDateTime(ASN1_TIME* time);
 }
 }

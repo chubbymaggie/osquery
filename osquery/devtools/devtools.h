@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,17 +10,24 @@
 
 #pragma once
 
+#include <map>
 #include <string>
+#include <vector>
 
-#include <osquery/database.h>
 #include <osquery/flags.h>
+#include <osquery/query.h>
 
 namespace osquery {
 
 /// Show all tables and exit the shell.
 DECLARE_bool(L);
+
 /// Select all from a table an exit the shell.
 DECLARE_string(A);
+
+/// The shell may request execution of all queries in a pack immediately.
+DECLARE_string(pack);
+
 /// The shell may need to disable events for fast operations.
 DECLARE_bool(disable_events);
 

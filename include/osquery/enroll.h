@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,7 +10,10 @@
 
 #pragma once
 
+#include <set>
 #include <string>
+
+#include <boost/property_tree/ptree.hpp>
 
 #include <osquery/flags.h>
 #include <osquery/registry.h>
@@ -19,6 +22,14 @@ namespace osquery {
 
 /// Allow users to disable enrollment features.
 DECLARE_bool(disable_enrollment);
+
+/**
+ * @brief These tables populate the "host_details" content.
+ *
+ * Enrollment plugins should send 'default' host details to enroll request
+ * endpoints. This allows the enrollment service to identify the new node.
+ */
+extern const std::set<std::string> kEnrollHostDetails;
 
 /**
  * @brief Superclass for enroll plugins.
@@ -45,16 +56,22 @@ class EnrollPlugin : public Plugin {
   /**
    * @brief Perform enrollment on the request of a config/logger.
    *
-   * The single 'enroll' plugin request action will call EnrollPlugin::enroll,
-   * the requester may include an optional "force" key to ask the enroll plugin
-   * to perhaps re-request an enrollment rather than doing a cache lookup.
-   * This force functionality is optional and implemented/described by each
-   * enroll plugin.
+   * The single 'enroll' plugin request action will call EnrollPlugin::enroll
    *
-   * @param force An optionally-supported/used request to force re-enrollment.
    * @return An enrollment secret or key material or identifier.
    */
   virtual std::string enroll() = 0;
+
+  /**
+   * @brief Populate a property tree with host details.
+   *
+   * This will use kEnrollHostDetails to select from each table and
+   * construct a property tree from the results of the first row of each.
+   * The input property tree will have a key set for each table.
+   *
+   * @param host_details An output property tree containing each table.
+   */
+  void genHostDetails(boost::property_tree::ptree& host_details);
 };
 
 /**
@@ -69,8 +86,7 @@ class EnrollPlugin : public Plugin {
  * exists in the backing store, the result will be cached.
  *
  * @param enroll_plugin Name of the enroll plugin to use if no node_key set.
- * @param force Optionally bypass cache and force call the enroll plugin.
- * @return node_key A unique, often private, node secret key.
+ * @return A unique, often private, node secret key.
  */
 std::string getNodeKey(const std::string& enroll_plugin);
 
@@ -91,13 +107,4 @@ Status clearNodeKey();
  * @return enroll_secret The trimmed content read from FLAGS_enroll_secret_path.
  */
 const std::string getEnrollSecret();
-
-/**
- * @brief Enroll plugin registry.
- *
- * This creates an osquery registry for "enroll" which may implement
- * EnrollPlugin. Only strings are logged in practice, and EnrollPlugin
- * provides a helper member for transforming PluginRequests to strings.
- */
-CREATE_LAZY_REGISTRY(EnrollPlugin, "enroll");
 }

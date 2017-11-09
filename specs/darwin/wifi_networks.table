@@ -14,5 +14,8 @@ schema([
     Column("temporarily_disabled", INTEGER, "1 if this network is temporarily disabled, 0 otherwise"),
     Column("disabled", INTEGER, "1 if this network is disabled, 0 otherwise"),
 ])
-attributes(cachable=True)
+attributes(cacheable=True)
 implementation("networking/wifi@genKnownWifiNetworks")
+fuzz_paths([
+    "/Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist"
+])

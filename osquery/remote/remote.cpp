@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,8 +8,8 @@
  *
  */
 
-#include <string>
 #include <cstring>
+#include <string>
 
 #include <zlib.h>
 
@@ -18,7 +18,7 @@ namespace osquery {
 #define MOD_GZIP_ZLIB_WINDOWSIZE 15
 #define MOD_GZIP_ZLIB_CFACTOR 9
 
-void compress(std::string& data) {
+std::string compressString(const std::string& data) {
   z_stream zs;
   memset(&zs, 0, sizeof(zs));
 
@@ -28,11 +28,11 @@ void compress(std::string& data) {
                    MOD_GZIP_ZLIB_WINDOWSIZE + 16,
                    MOD_GZIP_ZLIB_CFACTOR,
                    Z_DEFAULT_STRATEGY) != Z_OK) {
-    return;
+    return std::string();
   }
 
   zs.next_in = (Bytef*)data.data();
-  zs.avail_in = data.size();
+  zs.avail_in = static_cast<uInt>(data.size());
 
   int ret = Z_OK;
   std::string output;
@@ -41,7 +41,7 @@ void compress(std::string& data) {
     char buffer[16384] = {0};
     while (ret == Z_OK) {
       zs.next_out = reinterpret_cast<Bytef*>(buffer);
-      zs.avail_out = sizeof(output);
+      zs.avail_out = sizeof(buffer);
 
       ret = deflate(&zs, Z_FINISH);
       if (output.size() < zs.total_out) {
@@ -52,9 +52,9 @@ void compress(std::string& data) {
 
   deflateEnd(&zs);
   if (ret != Z_STREAM_END) {
-    return;
+    return std::string();
   }
 
-  data = std::move(output);
+  return output;
 }
 }

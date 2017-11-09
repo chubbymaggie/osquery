@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -14,7 +14,8 @@
 
 #include <benchmark/benchmark.h>
 
-#include "osquery/dispatcher/dispatcher.h"
+#include <osquery/dispatcher.h>
+
 #include "osquery/events/kernel.h"
 
 namespace osquery {
@@ -40,7 +41,7 @@ static inline void producerThread(benchmark::State &state) {
     if (queue == nullptr) {
       continue;
     }
-    drops += queue->kernelSync(OSQUERY_NO_BLOCK);
+    drops += queue->kernelSync(OSQUERY_OPTIONS_NO_BLOCK);
     syncs++;
     max_before_sync = 2000;
     while (max_before_sync > 0 && (event = queue->dequeue(&event_buf))) {

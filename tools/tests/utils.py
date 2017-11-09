@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
@@ -15,9 +15,9 @@ from __future__ import unicode_literals
 import json
 import os
 import sys
-import psutil
 import time
 import subprocess
+import shutil
 import re
 
 def red(msg):
@@ -52,6 +52,20 @@ def write_config(data={}, path=None):
         fh.write(json.dumps(data))
 
 
+def reset_dir(p):
+    # Note that files may be added concurrently.
+    # If they are then either of these will fail.
+    shutil.rmtree(p, ignore_errors=True)
+    try:
+        os.makedirs(p)
+    except Exception:
+        pass
+
+
+def copy_file(f, d):
+    shutil.copy(f, d)
+
+
 def platform():
     platform = sys.platform
     if platform.find("linux") == 0:
@@ -63,7 +77,7 @@ def platform():
 
 def queries_from_config(config_path):
     config = {}
-    rmcomment = re.compile('\/\*[\*A-Za-z0-9\n\s\.\{\}\'\/\\\:]+\*/|//.*')
+    rmcomment = re.compile('\/\*[\*A-Za-z0-9\n\s\.\{\}\'\/\\\:]+\*\/|\s+\/\/.*|^\/\/.*|\x5c\x5c\x0a')
     try:
         with open(config_path, "r") as fh:
             configcontent = fh.read()
@@ -81,18 +95,18 @@ def queries_from_config(config_path):
             queries[name] = details["query"]
     if "packs" in config:
         for keys,values in config["packs"].iteritems():
-            with open(values) as fp:
-                packfile = fp.read()
-                packcontent = rmcomment.sub('',packfile)
-                packqueries = json.loads(packcontent)
-                for queryname,query in packqueries["queries"].iteritems():
-                    queries["pack_"+queryname] = query["query"]
+            # Check if it is an internal pack definition
+            if type(values) is dict:
+                for queryname, query in values["queries"].iteritems():
+                    queries["pack_" + queryname] = query["query"]
+            else:
+                with open(values) as fp:
+                    packfile = fp.read()
+                    packcontent = rmcomment.sub('', packfile)
+                    packqueries = json.loads(packcontent)
+                    for queryname, query in packqueries["queries"].iteritems():
+                        queries["pack_" + queryname] = query["query"]
 
-
-        pass
-    if len(queries) == 0:
-        print("Could not find a schedule/queries in config: %s" % config_path)
-        exit(0)
     return queries
 
 
@@ -108,7 +122,7 @@ def queries_from_tables(path, restrict):
                 continue
             spec_platform = os.path.basename(base)
             table_name = spec.split(".table", 1)[0]
-            if spec_platform not in ["specs", platform()]:
+            if spec_platform not in ["specs", "posix", platform()]:
                 continue
             # Generate all tables to select from, with abandon.
             tables.append("%s.%s" % (spec_platform, table_name))
@@ -134,6 +148,7 @@ def get_stats(p, interval=1):
 
 
 def profile_cmd(cmd, proc=None, shell=False, timeout=0, count=1):
+    import psutil
     start_time = time.time()
     if proc is None:
         proc = subprocess.Popen(cmd,
@@ -156,6 +171,8 @@ def profile_cmd(cmd, proc=None, shell=False, timeout=0, count=1):
             stats = current_stats
             percents.append(stats["utilization"])
         except psutil.AccessDenied:
+            break
+        except psutil.ZombieProcess:
             break
         delay += step
         if timeout > 0 and delay >= timeout + 2:

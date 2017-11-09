@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,16 +8,22 @@
  *
  */
 
-#include <vector>
 #include <string>
+#include <vector>
 
 #include <osquery/core.h>
+#include <osquery/flags.h>
 #include <osquery/logger.h>
 #include <osquery/tables.h>
 
 #include "osquery/events/linux/udev.h"
 
 namespace osquery {
+
+FLAG(string,
+     hardware_disabled_types,
+     "partition",
+     "List of disabled hardware event types");
 
 /**
  * @brief Track udev events in Linux
@@ -50,9 +56,13 @@ Status HardwareEventSubscriber::Callback(const ECRef& ec, const SCRef& sc) {
   }
 
   struct udev_device* device = ec->device;
+  r["type"] = ec->devtype;
+  if (FLAGS_hardware_disabled_types.find(r.at("type")) != std::string::npos) {
+    return Status(0, "Disabled type.");
+  }
+
   r["action"] = ec->action_string;
   r["path"] = ec->devnode;
-  r["type"] = ec->devtype;
   r["driver"] = ec->driver;
 
   // UDEV properties.
@@ -69,7 +79,7 @@ Status HardwareEventSubscriber::Callback(const ECRef& ec, const SCRef& sc) {
   r["serial"] =
       INTEGER(UdevEventPublisher::getValue(device, "ID_SERIAL_SHORT"));
   r["revision"] = INTEGER(UdevEventPublisher::getValue(device, "ID_REVISION"));
-  add(r, ec->time);
-  return Status(0, "OK");
+  add(r);
+  return Status(0);
 }
 }

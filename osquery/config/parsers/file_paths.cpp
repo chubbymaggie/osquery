@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -25,7 +25,7 @@ class FilePathsConfigParserPlugin : public ConfigParserPlugin {
   virtual ~FilePathsConfigParserPlugin() {}
 
   std::vector<std::string> keys() const override {
-    return {"file_paths", "file_accesses"};
+    return {"file_paths", "file_accesses", "exclude_paths"};
   }
 
   Status setUp() override { return Status(0); };
@@ -40,6 +40,7 @@ class FilePathsConfigParserPlugin : public ConfigParserPlugin {
 FilePathsConfigParserPlugin::FilePathsConfigParserPlugin() {
   data_.put_child("file_paths", pt::ptree());
   data_.put_child("file_accesses", pt::ptree());
+  data_.put_child("exclude_paths", pt::ptree());
 }
 
 Status FilePathsConfigParserPlugin::update(const std::string& source,
@@ -59,14 +60,16 @@ Status FilePathsConfigParserPlugin::update(const std::string& source,
       access_map_[source].push_back(path);
     }
     // Regenerate the access:
-    for (const auto& source : access_map_) {
-      for (const auto& category : source.second) {
-        accesses.put(category, source.first);
+    for (const auto& access_source : access_map_) {
+      for (const auto& category : access_source.second) {
+        accesses.put(category, access_source.first);
       }
     }
   }
 
-  Config::getInstance().removeFiles(source);
+  Config::get().removeFiles(source);
+
+  std::set<std::string> valid_categories;
   for (const auto& category : data_.get_child("file_paths")) {
     for (const auto& path : category.second) {
       auto pattern = path.second.get_value<std::string>("");
@@ -74,8 +77,28 @@ Status FilePathsConfigParserPlugin::update(const std::string& source,
         continue;
       }
       replaceGlobWildcards(pattern);
-      Config::getInstance().addFile(source, category.first, pattern);
+      Config::get().addFile(source, category.first, pattern);
+      valid_categories.insert(category.first);
     }
+  }
+
+  if (config.count("exclude_paths") > 0) {
+    data_.put_child("exclude_paths", config.at("exclude_paths"));
+  }
+
+  std::set<std::string> invalid_categories;
+  for (const auto& excl_category : data_.get_child("exclude_paths")) {
+    if (valid_categories.find(excl_category.first) == valid_categories.end()) {
+      // valid_categories contains all the valid categories collected from
+      // traversing "file_paths" above.
+      invalid_categories.insert(excl_category.first);
+    }
+  }
+
+  for (const auto& invalid_category : invalid_categories) {
+    // invalid_categories contains all the categories which are mentioned in
+    // exclude_paths but not found in file_paths.
+    data_.get_child("exclude_paths").erase(invalid_category);
   }
 
   return Status(0, "OK");

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,25 +8,28 @@
  *
  */
 
+#include <chrono>
 #include <exception>
+#include <thread>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/lexical_cast.hpp>
 
 #include <osquery/config.h>
-#include <osquery/core.h>
+#include <osquery/database.h>
 #include <osquery/events.h>
 #include <osquery/flags.h>
 #include <osquery/logger.h>
+#include <osquery/sql.h>
+#include <osquery/system.h>
 
 #include "osquery/core/conversions.h"
-#include "osquery/database/db_handle.h"
 
 namespace osquery {
 
-/// Helper cooloff (ms) macro to prevent thread failure thrashing.
-#define EVENTS_COOLOFF 20
+CREATE_REGISTRY(EventPublisherPlugin, "event_publisher");
+CREATE_REGISTRY(EventSubscriberPlugin, "event_subscriber");
 
 /// Checkpoint interval to inspect max event buffering.
 #define EVENTS_CHECKPOINT 256
@@ -38,22 +41,13 @@ FLAG(bool,
      true,
      "Optimize subscriber select queries (scheduler only)");
 
-FLAG(uint64,
-     events_expiry,
-     86000,
-     "Timeout to expire event subscriber results");
+// Access this flag through EventSubscriberPlugin::getEventsExpiry to allow for
+// overriding in subclasses
+FLAG(uint64, events_expiry, 3600, "Timeout to expire event subscriber results");
 
-FLAG(uint64, events_max, 1000, "Maximum number of events per type to buffer");
-
-const std::vector<size_t> kEventTimeLists = {
-    1 * 60 * 60, // 1 hour
-    1 * 60, // 1 minute
-    10, // 10 seconds
-};
-
-void publisherSleep(size_t milli) {
-  boost::this_thread::sleep(boost::posix_time::milliseconds(milli));
-}
+// Access this flag through EventSubscriberPlugin::getEventsMax to allow for
+// overriding in subclasses
+FLAG(uint64, events_max, 50000, "Maximum number of events per type to buffer");
 
 static inline EventTime timeFromRecord(const std::string& record) {
   // Convert a stored index "as string bytes" to a time value.
@@ -64,9 +58,61 @@ static inline EventTime timeFromRecord(const std::string& record) {
   return afinite;
 }
 
-QueryData EventSubscriberPlugin::genTable(QueryContext& context) {
+static inline std::string toIndex(size_t i) {
+  auto j = std::to_string(i);
+  size_t n = 1;
+  while (i /= 10) {
+    n++;
+  }
+  return (n >= 10) ? j : std::string(10 - n, '0').append(std::move(j));
+}
+
+static inline void getOptimizeData(EventTime& o_time,
+                                   size_t& o_eid,
+                                   std::string& query_name,
+                                   const std::string& publisher) {
+  // Read the optimization time for the current executing query.
+  getDatabaseValue(kPersistentSettings, kExecutingQuery, query_name);
+  if (query_name.empty()) {
+    o_time = 0;
+    o_eid = 0;
+    return;
+  }
+
+  {
+    std::string content;
+    getDatabaseValue(kEvents, "optimize." + query_name, content);
+    long long optimize_time = 0;
+    safeStrtoll(content, 10, optimize_time);
+    o_time = static_cast<EventTime>(optimize_time);
+  }
+
+  {
+    std::string content;
+    getDatabaseValue(kEvents, "optimize_eid." + query_name, content);
+    long long optimize_eid = 0;
+    safeStrtoll(content, 10, optimize_eid);
+    o_eid = static_cast<size_t>(optimize_eid);
+  }
+}
+
+static inline void setOptimizeData(EventTime time,
+                                   size_t eid,
+                                   const std::string& publisher) {
+  // Store the optimization time and eid.
+  std::string query_name;
+  getDatabaseValue(kPersistentSettings, kExecutingQuery, query_name);
+  if (query_name.empty()) {
+    return;
+  }
+
+  setDatabaseValue(kEvents, "optimize." + query_name, std::to_string(time));
+  setDatabaseValue(kEvents, "optimize_eid." + query_name, toIndex(eid));
+}
+
+void EventSubscriberPlugin::genTable(RowYield& yield, QueryContext& context) {
   // Stop is an unsigned (-1), our end of time equivalent.
-  EventTime start = 0, stop = -1;
+  EventTime start = 0, stop = 0;
   if (context.constraints["time"].getAll().size() > 0) {
     // Use the 'time' constraint to optimize backing-store lookups.
     for (const auto& constraint : context.constraints["time"].getAll()) {
@@ -84,14 +130,21 @@ QueryData EventSubscriberPlugin::genTable(QueryContext& context) {
         stop = std::min(stop, expr);
       }
     }
-  } else if (kToolType == OSQUERY_TOOL_DAEMON && FLAGS_events_optimize) {
+  } else if (Initializer::isDaemon() && FLAGS_events_optimize) {
     // If the daemon is querying a subscriber without a 'time' constraint and
     // allows optimization, only emit events since the last query.
+    std::string query_name;
+    getOptimizeData(optimize_time_, optimize_eid_, query_name, dbNamespace());
     start = optimize_time_;
     optimize_time_ = getUnixTime() - 1;
-  }
 
-  return get(start, stop);
+    // Track the queries that have selected data.
+    WriteLock lock(event_query_record_);
+    if (!query_name.empty() && queries_.count(query_name) == 0) {
+      queries_.insert(query_name);
+    }
+  }
+  get(yield, start, stop);
 }
 
 void EventPublisherPlugin::fire(const EventContextRef& ec, EventTime time) {
@@ -102,7 +155,7 @@ void EventPublisherPlugin::fire(const EventContextRef& ec, EventTime time) {
 
   EventContextID ec_id = 0;
   {
-    boost::lock_guard<boost::mutex> lock(ec_id_lock_);
+    WriteLock lock(ec_id_lock_);
     ec_id = next_ec_id_++;
   }
 
@@ -117,114 +170,61 @@ void EventPublisherPlugin::fire(const EventContextRef& ec, EventTime time) {
     }
   }
 
+  WriteLock lock(subscription_lock_);
   for (const auto& subscription : subscriptions_) {
     auto es = EventFactory::getEventSubscriber(subscription->subscriber_name);
-    if (es != nullptr && es->state() == SUBSCRIBER_RUNNING) {
-      es->event_count_++;
+    if (es != nullptr && es->state() == EventState::EVENT_RUNNING) {
       fireCallback(subscription, ec);
     }
   }
 }
 
-std::set<std::string> EventSubscriberPlugin::getIndexes(EventTime start,
-                                                        EventTime stop,
-                                                        size_t list_key) {
-  auto db = DBHandle::getInstance();
+std::vector<std::string> EventSubscriberPlugin::getIndexes(EventTime start,
+                                                           EventTime stop,
+                                                           bool sort) {
   auto index_key = "indexes." + dbNamespace();
-  std::set<std::string> indexes;
+  std::vector<std::string> indexes;
 
-  // Keep track of the tail/head of account time while bin searching.
-  EventTime start_max = stop, stop_min = stop, local_start, local_stop;
-  auto types = kEventTimeLists.size();
-  // List types are sized bins of time containing records for this namespace.
-  for (size_t i = 0; i < types; ++i) {
-    auto size = kEventTimeLists[i];
-    if (list_key > 0 && i != list_key) {
-      // A specific list_type was requested, only return bins of this key.
-      continue;
+  EventTime l_start = (start > 0) ? start / 60 : 0;
+  EventTime r_stop = (stop > 0) ? stop / 60 + 1 : 0;
+
+  std::string content;
+  getDatabaseValue(kEvents, index_key + ".60", content);
+  if (content.empty()) {
+    return indexes;
+  }
+
+  std::vector<std::string> bins, expirations;
+  boost::split(bins, content, boost::is_any_of(","));
+  for (const auto& bin : bins) {
+    auto step = timeFromRecord(bin);
+    auto step_start = step * 60;
+    auto step_stop = (step + 1) * 60;
+    if (step_stop <= expire_time_) {
+      expirations.push_back(bin);
+    } else if (step_start < expire_time_ && sort) {
+      expireRecords("60", bin, false);
     }
 
-    std::string time_list;
-    auto list_type = boost::lexical_cast<std::string>(size);
-    db->Get(kEvents, index_key + "." + list_type, time_list);
-    if (time_list.empty()) {
-      // No events in this binning size.
-      return indexes;
+    if (step >= l_start && (r_stop == 0 || step < r_stop) && sort) {
+      indexes.push_back("60." + bin);
     }
+  }
 
-    if (list_key == 0 && i == (types - 1) && types > 1) {
-      // Relax the requested start/stop bounds.
-      if (start != start_max) {
-        start = (start / size) * size;
-        start_max = ((start / size) + 1) * size;
-        if (start_max < stop) {
-          start_max = start + kEventTimeLists[types - 2];
-        }
-      }
+  // Rewrite the index lists and delete each expired item.
+  if (!expirations.empty()) {
+    expireIndexes("60", bins, expirations);
+  }
 
-      if (stop != stop_min) {
-        stop = ((stop / size) + 1) * size;
-        stop_min = (stop / size) * size;
-        if (stop_min > start) {
-          stop_min = stop_min - kEventTimeLists[types - 1];
-        }
-      }
-    } else if (list_key > 0 || types == 1) {
-      // Relax the requested bounds to fit the requested/only index.
-      start = (start / size) * size;
-      start_max = ((start_max / size) + 1) * size;
-    }
-
-    // (1) The first iteration will have 1 range (start to start_max=stop).
-    // (2) Intermediate iterations will have 2 (start-start_max, stop-stop_min).
-    // For each iteration the range collapses based on the coverage using
-    // the first bin's start time and the last bin's stop time.
-    // (3) The last iteration's range includes relaxed bounds outside the
-    // requested start to stop range.
-    std::vector<std::string> all_bins, bins, expirations;
-    boost::split(all_bins, time_list, boost::is_any_of(","));
-    for (const auto& bin : all_bins) {
-      // Bins are identified by the binning size step.
-      auto step = timeFromRecord(bin);
-      // Check if size * step -> size * (step + 1) is within a range.
-      size_t bin_start = size * step;
-      size_t bin_stop = size * (step + 1);
-      if (expire_events_ && expire_time_ > 0) {
-        if (bin_stop <= expire_time_) {
-          // This entire bin will be expired.
-          expirations.push_back(bin);
-        } else if (bin_start < expire_time_) {
-          expireRecords(list_type, bin, false);
-        }
-      }
-
-      if (bin_start >= start && bin_stop <= start_max) {
-        bins.push_back(bin);
-      } else if ((bin_start >= stop_min && bin_stop <= stop) || stop == 0) {
-        bins.push_back(bin);
-      }
-    }
-
-    // Rewrite the index lists and delete each expired item.
-    if (!expirations.empty()) {
-      expireIndexes(list_type, all_bins, expirations);
-    }
-
-    if (!bins.empty()) {
-      // If more precision was achieved though this list's binning.
-      local_start = timeFromRecord(bins.front()) * size;
-      start_max = (local_start < start_max) ? local_start : start_max;
-      local_stop = (timeFromRecord(bins.back()) + 1) * size;
-      stop_min = (local_stop < stop_min) ? local_stop : stop_min;
-    }
-
-    for (const auto& bin : bins) {
-      indexes.insert(list_type + "." + bin);
-    }
-
-    if (start == start_max && stop == stop_min) {
-      break;
-    }
+  // Return indexes in binning order.
+  if (sort) {
+    std::sort(indexes.begin(),
+              indexes.end(),
+              [](const std::string& left, const std::string& right) {
+                auto n1 = timeFromRecord(left.substr(left.find('.') + 1));
+                auto n2 = timeFromRecord(right.substr(right.find('.') + 1));
+                return n1 < n2;
+              });
   }
 
   // Update the new time that events expire to now - expiry.
@@ -234,29 +234,39 @@ std::set<std::string> EventSubscriberPlugin::getIndexes(EventTime start,
 void EventSubscriberPlugin::expireRecords(const std::string& list_type,
                                           const std::string& index,
                                           bool all) {
-  auto db = DBHandle::getInstance();
+  if (!executedAllQueries()) {
+    return;
+  }
+
   auto record_key = "records." + dbNamespace();
   auto data_key = "data." + dbNamespace();
 
   // If the expirations is not removing all records, rewrite the persisting.
   std::vector<std::string> persisting_records;
   // Request all records within this list-size + bin offset.
-  auto expired_records = getRecords({list_type + "." + index});
-  for (const auto& record : expired_records) {
-    if (all) {
-      db->Delete(kEvents, data_key + "." + record.first);
-    } else if (record.second > expire_time_) {
-      persisting_records.push_back(record.first + ":" +
-                                   std::to_string(record.second));
+  auto expired_records = getRecords({list_type + '.' + index}, false);
+  if (all && expired_records.size() > 1) {
+    deleteDatabaseRange(kEvents,
+                        data_key + '.' + expired_records.begin()->first,
+                        data_key + '.' + expired_records.rbegin()->first);
+  } else {
+    for (const auto& record : expired_records) {
+      if (record.second <= expire_time_) {
+        deleteDatabaseValue(kEvents, data_key + '.' + record.first);
+      } else {
+        persisting_records.push_back(record.first + ':' +
+                                     std::to_string(record.second));
+      }
     }
   }
 
   // Either drop or overwrite the record list.
   if (all) {
-    db->Delete(kEvents, record_key + "." + list_type + "." + index);
-  } else {
+    deleteDatabaseValue(kEvents, record_key + "." + list_type + "." + index);
+  } else if (persisting_records.size() < expired_records.size()) {
     auto new_records = boost::algorithm::join(persisting_records, ",");
-    db->Put(kEvents, record_key + "." + list_type + "." + index, new_records);
+    setDatabaseValue(
+        kEvents, record_key + "." + list_type + "." + index, new_records);
   }
 }
 
@@ -264,7 +274,10 @@ void EventSubscriberPlugin::expireIndexes(
     const std::string& list_type,
     const std::vector<std::string>& indexes,
     const std::vector<std::string>& expirations) {
-  auto db = DBHandle::getInstance();
+  if (!executedAllQueries()) {
+    return;
+  }
+
   auto index_key = "indexes." + dbNamespace();
 
   // Construct a mutable list of persisting indexes to rewrite as records.
@@ -279,33 +292,75 @@ void EventSubscriberPlugin::expireIndexes(
 
   // Update the list of indexes with the non-expired indexes.
   auto new_indexes = boost::algorithm::join(persisting_indexes, ",");
-  db->Put(kEvents, index_key + "." + list_type, new_indexes);
+  setDatabaseValue(kEvents, index_key + "." + list_type, new_indexes);
 }
 
 void EventSubscriberPlugin::expireCheck() {
-  auto db = DBHandle::getInstance();
   auto data_key = "data." + dbNamespace();
   auto eid_key = "eid." + dbNamespace();
+  // Min key will be the last surviving key.
+  size_t threshold_key = 0;
 
-  std::vector<std::string> keys;
-  db->ScanPrefix(kEvents, keys, data_key);
-  if (keys.size() <= FLAGS_events_max) {
-    return;
+  {
+    auto limit = getEventsMax();
+    std::vector<std::string> keys;
+    scanDatabaseKeys(kEvents, keys, data_key);
+    if (keys.size() <= limit) {
+      return;
+    }
+
+    // There is an overflow of events buffered for this subscriber.
+    LOG(WARNING) << "Expiring events for subscriber: " << getName()
+                 << " (overflowed limit " << limit << ")";
+    VLOG(1) << "Subscriber events " << getName() << " exceeded limit " << limit
+            << " by: " << keys.size() - limit;
+    // Inspect the N-FLAGS_events_max -th event's value and expire before the
+    // time within the content.
+    std::string last_key;
+    getDatabaseValue(kEvents, eid_key, last_key);
+    // The EID is the next-index.
+    // EID - events_max is the most last-recent event to keep.
+    threshold_key = boost::lexical_cast<size_t>(last_key) - getEventsMax();
+
+    // Scan each of the keys in keys, if their ID portion is < threshold.
+    // Nix them, this requires lots of conversions, use with care.
+    std::string max_key;
+    std::string min_key;
+    unsigned long min_key_value = 0;
+    unsigned long max_key_value = 0;
+    for (const auto& key : keys) {
+      unsigned long key_value = 0;
+      safeStrtoul(key.substr(key.rfind('.') + 1), 10, key_value);
+
+      if (key_value < static_cast<unsigned long>(threshold_key)) {
+        min_key_value = (min_key_value == 0 || key_value < min_key_value)
+                            ? key_value
+                            : min_key_value;
+        if (min_key_value == key_value) {
+          min_key = key;
+        }
+
+        max_key_value = (key_value > max_key_value) ? key_value : max_key_value;
+        if (max_key_value == key_value) {
+          max_key = key;
+        }
+      }
+    }
+
+    if (!min_key.empty()) {
+      if (max_key_value == min_key_value) {
+        deleteDatabaseValue(kEvents, min_key);
+      } else {
+        deleteDatabaseRange(kEvents, min_key, max_key);
+      }
+    }
   }
 
-  // There is an overflow of events buffered for this subscriber.
-  LOG(WARNING) << "Expiring events for subscriber: " << getName() << " limit ("
-               << FLAGS_events_max << ") exceeded: " << keys.size();
-  // Inspect the N-FLAGS_events_max -th event's value and expire before the
-  // time within the content.
-  std::string last_key;
-  db->Get(kEvents, eid_key, last_key);
-  // The EID is the next-index.
-  size_t max_key = boost::lexical_cast<size_t>(last_key) - FLAGS_events_max - 1;
-
   // Convert the key index into a time using the content.
+  // The last-recent event is fetched and the corresponding time is used as
+  // the expiration time for the subscriber.
   std::string content;
-  db->Get(kEvents, data_key + "." + std::to_string(max_key), content);
+  getDatabaseValue(kEvents, data_key + "." + toIndex(threshold_key), content);
 
   // Decode the value into a row structure to extract the time.
   Row r;
@@ -316,17 +371,21 @@ void EventSubscriberPlugin::expireCheck() {
   // The last time will become the implicit expiration time.
   size_t last_time = boost::lexical_cast<size_t>(r.at("time"));
   if (last_time > 0) {
-    expire_time_ = last_time;
+    expire_time_ = last_time - (last_time % 60);
   }
 
   // Finally, attempt an index query to trigger expirations.
   // In this case the result set is not used.
-  getIndexes(expire_time_ - 1, -1);
+  getIndexes(expire_time_, 0, false);
+}
+
+bool EventSubscriberPlugin::executedAllQueries() const {
+  ReadLock lock(event_query_record_);
+  return queries_.size() >= query_count_;
 }
 
 std::vector<EventRecord> EventSubscriberPlugin::getRecords(
-    const std::set<std::string>& indexes) {
-  auto db = DBHandle::getInstance();
+    const std::vector<std::string>& indexes, bool optimize) {
   auto record_key = "records." + dbNamespace();
 
   std::vector<EventRecord> records;
@@ -334,7 +393,7 @@ std::vector<EventRecord> EventSubscriberPlugin::getRecords(
     std::vector<std::string> bin_records;
     {
       std::string record_value;
-      db->Get(kEvents, record_key + "." + index, record_value);
+      getDatabaseValue(kEvents, record_key + "." + index, record_value);
       if (record_value.empty()) {
         // There are actually no events in this bin, interesting error case.
         continue;
@@ -348,105 +407,106 @@ std::vector<EventRecord> EventSubscriberPlugin::getRecords(
     // Iterate over every 2 items: EID:TIME.
     for (; bin_it != bin_records.end(); bin_it++) {
       const auto& eid = *bin_it;
-      EventTime time = timeFromRecord(*(++bin_it));
-      records.push_back(std::make_pair(eid, time));
+      EventTime et = timeFromRecord(*(++bin_it));
+      if (FLAGS_events_optimize && optimize && et <= optimize_time_ + 1) {
+        // There is an optimization collision, check for colliding IDs.
+        auto eidr = timeFromRecord(eid);
+        if (eidr <= optimize_eid_) {
+          continue;
+        }
+      }
+      records.push_back(std::make_pair(eid, et));
     }
   }
 
   return records;
 }
 
-Status EventSubscriberPlugin::recordEvent(EventID& eid, EventTime time) {
-  Status status;
-  auto db = DBHandle::getInstance();
-  std::string time_value = boost::lexical_cast<std::string>(time);
+Status EventSubscriberPlugin::recordEvent(const std::string& eid,
+                                          EventTime et) {
+  std::string time_value = boost::lexical_cast<std::string>(et);
 
   // The record is identified by the event type then module name.
   std::string index_key = "indexes." + dbNamespace();
   std::string record_key = "records." + dbNamespace();
   // The list key includes the list type (bin size) and the list ID (bin).
-  std::string list_key;
   std::string list_id;
 
-  for (const auto& time_list : kEventTimeLists) {
-    // The list_id is the MOST-Specific key ID, the bin for this list.
-    // If the event time was 13 and the time_list is 5 seconds, lid = 2.
-    list_id = boost::lexical_cast<std::string>(time / time_list);
-    // The list name identifies the 'type' of list.
-    list_key = boost::lexical_cast<std::string>(time_list);
-    // list_key = list_key + "." + list_id;
+  // The list_id is the MOST-Specific key ID, the bin for this list.
+  // If the event time was 13 and the time_list is 5 seconds, lid = 2.
+  list_id = boost::lexical_cast<std::string>(et / 60);
 
-    {
-      boost::lock_guard<boost::mutex> lock(event_record_lock_);
-      // Append the record (eid, unix_time) to the list bin.
-      std::string record_value;
-      status = db->Get(
-          kEvents, record_key + "." + list_key + "." + list_id, record_value);
+  WriteLock lock(event_record_lock_);
+  // Append the record (eid, unix_time) to the list bin.
+  std::string record_value;
+  getDatabaseValue(kEvents, record_key + ".60." + list_id, record_value);
 
-      if (record_value.length() == 0) {
-        // This is a new list_id for list_key, append the ID to the indirect
-        // lookup for this list_key.
-        std::string index_value;
-        status = db->Get(kEvents, index_key + "." + list_key, index_value);
-        if (index_value.length() == 0) {
-          // A new index.
-          index_value = list_id;
-        } else {
-          index_value += "," + list_id;
-        }
-        status = db->Put(kEvents, index_key + "." + list_key, index_value);
-        record_value = eid + ":" + time_value;
-      } else {
-        // Tokenize a record using ',' and the EID/time using ':'.
-        record_value += "," + eid + ":" + time_value;
-      }
-      status = db->Put(
-          kEvents, record_key + "." + list_key + "." + list_id, record_value);
-      if (!status.ok()) {
-        LOG(ERROR) << "Could not put Event Record key: " << record_key;
-      }
+  if (record_value.length() == 0) {
+    // This is a new list_id for list_key, append the ID to the indirect
+    // lookup for this list_key.
+    std::string index_value;
+    getDatabaseValue(kEvents, index_key + ".60", index_value);
+    if (index_value.length() == 0) {
+      // A new index.
+      index_value = list_id;
+    } else {
+      index_value += "," + list_id;
     }
+    setDatabaseValue(kEvents, index_key + ".60", index_value);
+    record_value = eid + ":" + time_value;
+  } else {
+    // Tokenize a record using ',' and the EID/time using ':'.
+    record_value += "," + eid + ":" + time_value;
   }
-
+  auto status =
+      setDatabaseValue(kEvents, record_key + ".60." + list_id, record_value);
+  if (!status.ok()) {
+    LOG(ERROR) << "Could not put Event Record key: " << record_key;
+  }
   return Status(0, "OK");
 }
 
-EventID EventSubscriberPlugin::getEventID() {
-  Status status;
-  auto db = DBHandle::getInstance();
-  // First get an event ID from the meta key.
-  std::string eid_key = "eid." + dbNamespace();
-  std::string last_eid_value;
-  std::string eid_value;
-
-  {
-    boost::lock_guard<boost::mutex> lock(event_id_lock_);
-    status = db->Get(kEvents, eid_key, last_eid_value);
-    if (!status.ok() || last_eid_value.empty()) {
-      last_eid_value = "0";
-    }
-
-    last_eid_ = boost::lexical_cast<size_t>(last_eid_value) + 1;
-    eid_value = boost::lexical_cast<std::string>(last_eid_);
-    status = db->Put(kEvents, eid_key, eid_value);
-  }
-
-  if (!status.ok()) {
-    return "0";
-  }
-
-  return eid_value;
+size_t EventSubscriberPlugin::getEventsExpiry() {
+  return FLAGS_events_expiry;
 }
 
-QueryData EventSubscriberPlugin::get(EventTime start, EventTime stop) {
-  QueryData results;
+size_t EventSubscriberPlugin::getEventsMax() {
+  return FLAGS_events_max;
+}
 
+const std::string EventSubscriberPlugin::getEventID() {
+  Status status;
+  // First get an event ID from the meta key.
+  std::string eid_key = "eid." + dbNamespace();
+
+  {
+    WriteLock lock(event_id_lock_);
+    if (last_eid_ == 0) {
+      std::string last_eid_value;
+      status = getDatabaseValue(kEvents, eid_key, last_eid_value);
+      if (!status.ok() || last_eid_value.empty()) {
+        last_eid_value = "0";
+      }
+      last_eid_ = boost::lexical_cast<size_t>(last_eid_value);
+    }
+
+    if (last_eid_ % 10 == 0) {
+      status = setDatabaseValue(kEvents, eid_key, toIndex(last_eid_ + 10));
+    }
+    last_eid_++;
+  }
+
+  return toIndex(last_eid_);
+}
+
+void EventSubscriberPlugin::get(RowYield& yield,
+                                EventTime start,
+                                EventTime stop) {
   // Get the records for this time range.
-  auto db = DBHandle::getInstance();
   auto indexes = getIndexes(start, stop);
   auto records = getRecords(indexes);
-  std::string events_key = "data." + dbNamespace();
 
+  std::string events_key = "data." + dbNamespace();
   std::vector<std::string> mapped_records;
   for (const auto& record : records) {
     if (record.second >= start && (record.second <= stop || stop == 0)) {
@@ -454,11 +514,19 @@ QueryData EventSubscriberPlugin::get(EventTime start, EventTime stop) {
     }
   }
 
+  if (FLAGS_events_optimize && !records.empty()) {
+    // If records were returned save the ordered-last as the optimization EID.
+    unsigned long int eidr = 0;
+    if (safeStrtoul(records.back().first, 10, eidr)) {
+      optimize_eid_ = static_cast<size_t>(eidr);
+    }
+  }
+
   // Select mapped_records using event_ids as keys.
   std::string data_value;
   for (const auto& record : mapped_records) {
     Row r;
-    auto status = db->Get(kEvents, record, data_value);
+    auto status = getDatabaseValue(kEvents, record, data_value);
     if (data_value.length() == 0) {
       // There is no record here, interesting error case.
       continue;
@@ -466,36 +534,48 @@ QueryData EventSubscriberPlugin::get(EventTime start, EventTime stop) {
     status = deserializeRowJSON(data_value, r);
     data_value.clear();
     if (status.ok()) {
-      results.push_back(std::move(r));
+      yield(r);
     }
   }
 
-  if (FLAGS_events_expiry > 0) {
+  auto expiry = getEventsExpiry();
+  if (expiry > 0) {
+    // Make sure the configured expiration is at least the minimum needed to
+    // execute all related queries in the schedule.
+    if (expiry < min_expiration_) {
+      expiry = min_expiration_;
+    }
+
     // Set the expire time to NOW - "configured lifetime".
     // Index retrieval will apply the constraints checking and auto-expire.
-    expire_time_ = getUnixTime() - FLAGS_events_expiry;
+    expire_time_ = getUnixTime() - expiry;
+    expire_time_ = expire_time_ - (expire_time_ % 60);
   }
-  return results;
+
+  if (FLAGS_events_optimize) {
+    setOptimizeData(optimize_time_, optimize_eid_, dbNamespace());
+  }
 }
 
 Status EventSubscriberPlugin::add(Row& r, EventTime event_time) {
-  std::shared_ptr<DBHandle> db = nullptr;
-  try {
-    db = DBHandle::getInstance();
-  } catch (const std::runtime_error& e) {
-    return Status(1, e.what());
+  // Get and increment the EID for this module.
+  const std::string eid = getEventID();
+  // Without encouraging a missing event time, do not support a 0-time.
+  if (event_time == 0) {
+    event_time = getUnixTime();
   }
 
-  // Get and increment the EID for this module.
-  EventID eid = getEventID();
-  // Without encouraging a missing event time, do not support a 0-time.
-  r["time"] = std::to_string((event_time == 0) ? getUnixTime() : event_time);
-
+  r["time"] = std::to_string(event_time);
+  r["eid"] = eid;
   // Serialize and store the row data, for query-time retrieval.
   std::string data;
   auto status = serializeRowJSON(r, data);
   if (!status.ok()) {
     return status;
+  }
+  // Then remove the newline.
+  if (data.size() > 0 && data.back() == '\n') {
+    data.pop_back();
   }
 
   // Use the last EventID and a checkpoint bucket size to periodically apply
@@ -504,12 +584,32 @@ Status EventSubscriberPlugin::add(Row& r, EventTime event_time) {
     expireCheck();
   }
 
+  // Logger plugins may request events to be forwarded directly.
+  // If no active logger is marked 'usesLogEvent' then this is a no-op.
+  EventFactory::forwardEvent(data);
+
   // Store the event data.
   std::string event_key = "data." + dbNamespace() + "." + eid;
-  status = db->Put(kEvents, event_key, data);
+  status = setDatabaseValue(kEvents, event_key, data);
   // Record the event in the indexing bins, using the index time.
   recordEvent(eid, event_time);
+  event_count_++;
   return status;
+}
+
+EventPublisherRef EventSubscriberPlugin::getPublisher() const {
+  return EventFactory::getEventPublisher(getType());
+}
+
+void EventSubscriberPlugin::removeSubscriptions() {
+  subscription_count_ = 0;
+  auto publisher = getPublisher();
+  if (publisher == nullptr) {
+    LOG(WARNING) << "Cannot remove subscriptions from: " << getName();
+    return;
+  }
+
+  getPublisher()->removeSubscriptions(getName());
 }
 
 void EventFactory::delay() {
@@ -523,15 +623,105 @@ void EventFactory::delay() {
   for (const auto& publisher : EventFactory::getInstance().event_pubs_) {
     // Publishers that did not set up correctly are put into an ending state.
     if (!publisher.second->isEnding()) {
-      auto thread_ = std::make_shared<boost::thread>(
+      auto thread_ = std::make_shared<std::thread>(
           boost::bind(&EventFactory::run, publisher.first));
       ef.threads_.push_back(thread_);
     }
   }
 }
 
-Status EventFactory::run(EventPublisherID& type_id) {
+Status EventPublisherPlugin::addSubscription(
+    const SubscriptionRef& subscription) {
+  // The publisher threads may be running and if they fire events the list of
+  // subscriptions will be walked.
+  WriteLock lock(subscription_lock_);
+  subscriptions_.push_back(subscription);
+  return Status(0);
+}
+
+void EventPublisherPlugin::removeSubscriptions(const std::string& subscriber) {
+  // See addSubscription for details on the critical section.
+  WriteLock lock(subscription_lock_);
+  auto end =
+      std::remove_if(subscriptions_.begin(),
+                     subscriptions_.end(),
+                     [&subscriber](const SubscriptionRef& subscription) {
+                       return (subscription->subscriber_name == subscriber);
+                     });
+  subscriptions_.erase(end, subscriptions_.end());
+}
+
+void EventFactory::addForwarder(const std::string& logger) {
+  getInstance().loggers_.push_back(logger);
+}
+
+void EventFactory::forwardEvent(const std::string& event) {
+  for (const auto& logger : getInstance().loggers_) {
+    Registry::call("logger", logger, {{"event", event}});
+  }
+}
+
+void EventFactory::configUpdate() {
+  // Scan the schedule for queries that touch "_events" tables.
+  // We will count the queries
+  std::map<std::string, SubscriberExpirationDetails> subscriber_details;
+  Config::get().scheduledQueries([&subscriber_details](
+      const std::string& name, const ScheduledQuery& query) {
+    std::vector<std::string> tables;
+    // Convert query string into a list of virtual tables effected.
+    if (!getQueryTables(query.query, tables)) {
+      VLOG(1) << "Cannot get tables from query: " << name;
+      return;
+    }
+
+    // Remove duplicates and select only the subscriber tables.
+    std::set<std::string> subscribers;
+    for (const auto& table : tables) {
+      if (Registry::get().exists("event_subscriber", table)) {
+        subscribers.insert(table);
+      }
+    }
+
+    for (const auto& subscriber : subscribers) {
+      auto& details = subscriber_details[subscriber];
+      details.max_interval = (query.interval > details.max_interval)
+                                 ? query.interval
+                                 : details.max_interval;
+      details.query_count++;
+    }
+  });
+
   auto& ef = EventFactory::getInstance();
+  for (const auto& details : subscriber_details) {
+    if (!ef.exists(details.first)) {
+      continue;
+    }
+
+    WriteLock lock(ef.factory_lock_);
+    auto subscriber = ef.getEventSubscriber(details.first);
+    subscriber->min_expiration_ = details.second.max_interval * 3;
+    subscriber->min_expiration_ += (60 - (subscriber->min_expiration_ % 60));
+
+    // Emit a warning for each subscriber affected by the small expiration.
+    auto expiry = subscriber->getEventsExpiry();
+    if (expiry > 0 && subscriber->min_expiration_ > expiry) {
+      LOG(INFO) << "Subscriber expiration is too low: "
+                << subscriber->getName();
+    }
+    subscriber->query_count_ = details.second.query_count;
+
+    WriteLock subscriber_lock(subscriber->event_query_record_);
+    subscriber->queries_.clear();
+  }
+
+  // If events are enabled configure the subscribers before publishers.
+  if (!FLAGS_disable_events) {
+    RegistryFactory::get().registry("event_subscriber")->configure();
+    RegistryFactory::get().registry("event_publisher")->configure();
+  }
+}
+
+Status EventFactory::run(const std::string& type_id) {
   if (FLAGS_disable_events) {
     return Status(0, "Events disabled");
   }
@@ -541,7 +731,12 @@ Status EventFactory::run(EventPublisherID& type_id) {
   // Assume it can either make use of an entrypoint poller/selector or
   // take care of async callback registrations in setUp/configure/run
   // only once and handle event queuing/firing in callbacks.
-  EventPublisherRef publisher = ef.getEventPublisher(type_id);
+  EventPublisherRef publisher = nullptr;
+  {
+    auto& ef = EventFactory::getInstance();
+    WriteLock lock(ef.factory_lock_);
+    publisher = ef.getEventPublisher(type_id);
+  }
 
   if (publisher == nullptr) {
     return Status(1, "Event publisher is missing");
@@ -552,23 +747,31 @@ Status EventFactory::run(EventPublisherID& type_id) {
   publisher->hasStarted(true);
 
   auto status = Status(0, "OK");
-  while (!publisher->isEnding() && status.ok()) {
+  while (!publisher->isEnding()) {
     // Can optionally implement a global cooloff latency here.
     status = publisher->run();
+    if (!status.ok()) {
+      break;
+    }
     publisher->restart_count_++;
-    osquery::publisherSleep(EVENTS_COOLOFF);
+    // This is a 'default' cool-off implemented in InterruptableRunnable.
+    // If a publisher fails to perform some sort of interruption point, this
+    // prevents the thread from thrashing through exiting checks.
+    publisher->pauseMilli(200);
   }
-  // The runloop status is not reflective of the event type's.
-  VLOG(1) << "Event publisher " << publisher->type()
-          << " run loop terminated for reason: " << status.getMessage();
-  // Publishers auto tear down when their run loop stops.
+  if (!status.ok()) {
+    // The runloop status is not reflective of the event type's.
+    VLOG(1) << "Event publisher " << publisher->type()
+            << " run loop terminated for reason: " << status.getMessage();
+    // Publishers auto tear down when their run loop stops.
+  }
   publisher->tearDown();
+  publisher->state(EventState::EVENT_NONE);
 
   // Do not remove the publisher from the event factory.
   // If the event factory's `end` method was called these publishers will be
   // cleaned up after their thread context is removed; otherwise, a removed
   // thread context and failed publisher will remain available for stats.
-  // ef.event_pubs_.erase(type_id);
   return Status(0, "OK");
 }
 
@@ -584,28 +787,42 @@ Status EventFactory::registerEventPublisher(const PluginRef& pub) {
   try {
     auto base_pub = std::dynamic_pointer_cast<EventPublisherPlugin>(pub);
     specialized_pub = std::static_pointer_cast<BaseEventPublisher>(base_pub);
-  } catch (const std::bad_cast& e) {
+  } catch (const std::bad_cast& /* e */) {
     return Status(1, "Incorrect plugin");
   }
 
   if (specialized_pub == nullptr || specialized_pub.get() == nullptr) {
-    return Status(0, "Invalid subscriber");
+    return Status(0, "Invalid publisher");
+  }
+
+  auto type_id = specialized_pub->type();
+  if (type_id.empty()) {
+    // This subscriber did not override its name.
+    return Status(1, "Publishers must have a type");
   }
 
   auto& ef = EventFactory::getInstance();
-  auto type_id = specialized_pub->type();
-  if (ef.event_pubs_.count(type_id) != 0) {
-    // This is a duplicate event publisher.
-    return Status(1, "Duplicate publisher type");
+  {
+    WriteLock lock(getInstance().factory_lock_);
+    if (ef.event_pubs_.count(type_id) != 0) {
+      // This is a duplicate event publisher.
+      return Status(1, "Duplicate publisher type");
+    }
+
+    // Do not set up event publisher if events are disabled.
+    ef.event_pubs_[type_id] = specialized_pub;
   }
 
-  // Do not set up event publisher if events are disabled.
-  ef.event_pubs_[type_id] = specialized_pub;
   if (!FLAGS_disable_events) {
+    if (specialized_pub->state() != EventState::EVENT_NONE) {
+      specialized_pub->tearDown();
+    }
+
     auto status = specialized_pub->setUp();
+    specialized_pub->state(EventState::EVENT_SETUP);
     if (!status.ok()) {
       // Only start event loop if setUp succeeds.
-      LOG(INFO) << "Event publisher failed setup: " << type_id << ": "
+      LOG(INFO) << "Event publisher not enabled: " << type_id << ": "
                 << status.what();
       specialized_pub->isEnding(true);
       return status;
@@ -621,7 +838,7 @@ Status EventFactory::registerEventSubscriber(const PluginRef& sub) {
   try {
     auto base_sub = std::dynamic_pointer_cast<EventSubscriberPlugin>(sub);
     specialized_sub = std::static_pointer_cast<BaseEventSubscriber>(base_sub);
-  } catch (const std::bad_cast& e) {
+  } catch (const std::bad_cast& /* e */) {
     return Status(1, "Incorrect plugin");
   }
 
@@ -632,7 +849,12 @@ Status EventFactory::registerEventSubscriber(const PluginRef& sub) {
   // The config may use an "events" key to explicitly enabled or disable
   // event subscribers. See EventSubscriber::disable.
   auto name = specialized_sub->getName();
-  auto plugin = Config::getInstance().getParser("events");
+  if (name.empty()) {
+    // This subscriber did not override its name.
+    return Status(1, "Subscribers must have set a name");
+  }
+
+  auto plugin = Config::get().getParser("events");
   if (plugin != nullptr && plugin.get() != nullptr) {
     const auto& data = plugin->getData();
     // First perform explicit enabling.
@@ -655,37 +877,50 @@ Status EventFactory::registerEventSubscriber(const PluginRef& sub) {
     }
   }
 
-  // Let the module initialize any Subscriptions.
-  auto status = Status(0, "OK");
+  if (specialized_sub->state() != EventState::EVENT_NONE) {
+    specialized_sub->tearDown();
+  }
+
+  // Allow subscribers a configure-time setup to determine if they should run.
+  auto status = specialized_sub->setUp();
+  if (!status) {
+    specialized_sub->disabled = true;
+  }
+  specialized_sub->state(EventState::EVENT_SETUP);
+
+  // Let the subscriber initialize any Subscriptions.
   if (!FLAGS_disable_events && !specialized_sub->disabled) {
     specialized_sub->expireCheck();
     status = specialized_sub->init();
-    specialized_sub->state(SUBSCRIBER_RUNNING);
+    specialized_sub->state(EventState::EVENT_RUNNING);
   } else {
-    specialized_sub->state(SUBSCRIBER_PAUSED);
+    specialized_sub->state(EventState::EVENT_PAUSED);
   }
 
   auto& ef = EventFactory::getInstance();
-  ef.event_subs_[name] = specialized_sub;
+  {
+    WriteLock lock(getInstance().factory_lock_);
+    ef.event_subs_[name] = specialized_sub;
+  }
 
   // Set state of subscriber.
   if (!status.ok()) {
-    specialized_sub->state(SUBSCRIBER_FAILED);
+    specialized_sub->state(EventState::EVENT_FAILED);
     return Status(1, status.getMessage());
   } else {
     return Status(0, "OK");
   }
 }
 
-Status EventFactory::addSubscription(EventPublisherID& type_id,
-                                     EventSubscriberID& name_id,
+Status EventFactory::addSubscription(const std::string& type_id,
+                                     const std::string& name_id,
                                      const SubscriptionContextRef& mc,
                                      EventCallback cb) {
   auto subscription = Subscription::create(name_id, mc, cb);
   return EventFactory::addSubscription(type_id, subscription);
 }
 
-Status EventFactory::addSubscription(EventPublisherID& type_id,
+Status EventFactory::addSubscription(const std::string& type_id,
                                      const SubscriptionRef& subscription) {
   EventPublisherRef publisher = getInstance().getEventPublisher(type_id);
   if (publisher == nullptr) {
@@ -696,17 +931,20 @@ Status EventFactory::addSubscription(EventPublisherID& type_id,
   return publisher->addSubscription(subscription);
 }
 
-size_t EventFactory::numSubscriptions(EventPublisherID& type_id) {
+size_t EventFactory::numSubscriptions(const std::string& type_id) {
   EventPublisherRef publisher;
   try {
     publisher = EventFactory::getInstance().getEventPublisher(type_id);
-  } catch (std::out_of_range& e) {
+  } catch (std::out_of_range& /* e */) {
+    return 0;
+  }
+  if (publisher == nullptr) {
     return 0;
   }
   return publisher->numSubscriptions();
 }
 
-EventPublisherRef EventFactory::getEventPublisher(EventPublisherID& type_id) {
+EventPublisherRef EventFactory::getEventPublisher(const std::string& type_id) {
   if (getInstance().event_pubs_.count(type_id) == 0) {
     LOG(ERROR) << "Requested unknown/failed event publisher: " + type_id;
     return nullptr;
@@ -715,7 +953,7 @@ EventPublisherRef EventFactory::getEventPublisher(EventPublisherID& type_id) {
 }
 
 EventSubscriberRef EventFactory::getEventSubscriber(
-    EventSubscriberID& name_id) {
+    const std::string& name_id) {
   if (!exists(name_id)) {
     LOG(ERROR) << "Requested unknown event subscriber: " + name_id;
     return nullptr;
@@ -723,7 +961,7 @@ EventSubscriberRef EventFactory::getEventSubscriber(
   return getInstance().event_subs_.at(name_id);
 }
 
-bool EventFactory::exists(EventSubscriberID& name_id) {
+bool EventFactory::exists(const std::string& name_id) {
   return (getInstance().event_subs_.count(name_id) > 0);
 }
 
@@ -731,8 +969,10 @@ Status EventFactory::deregisterEventPublisher(const EventPublisherRef& pub) {
   return EventFactory::deregisterEventPublisher(pub->type());
 }
 
-Status EventFactory::deregisterEventPublisher(EventPublisherID& type_id) {
+Status EventFactory::deregisterEventPublisher(const std::string& type_id) {
   auto& ef = EventFactory::getInstance();
+
+  WriteLock lock(ef.factory_lock_);
   EventPublisherRef publisher = ef.getEventPublisher(type_id);
   if (publisher == nullptr) {
     return Status(1, "No event publisher to deregister");
@@ -744,17 +984,34 @@ Status EventFactory::deregisterEventPublisher(EventPublisherID& type_id) {
       // If a publisher's run loop was not started, call tearDown since
       // the setUp happened at publisher registration time.
       publisher->tearDown();
+      publisher->state(EventState::EVENT_NONE);
       // If the run loop did run the tear down and erase will happen in the
       // event thread wrapper when isEnding is next checked.
       ef.event_pubs_.erase(type_id);
     } else {
-      publisher->end();
+      publisher->stop();
     }
   }
   return Status(0, "OK");
 }
 
+Status EventFactory::deregisterEventSubscriber(const std::string& sub) {
+  auto& ef = EventFactory::getInstance();
+
+  WriteLock lock(ef.factory_lock_);
+  if (ef.event_subs_.count(sub) == 0) {
+    return Status(1, "Event subscriber is missing");
+  }
+
+  auto& subscriber = ef.event_subs_.at(sub);
+  subscriber->state(EventState::EVENT_NONE);
+  subscriber->tearDown();
+  ef.event_subs_.erase(sub);
+  return Status(0);
+}
+
 std::vector<std::string> EventFactory::publisherTypes() {
+  WriteLock lock(getInstance().factory_lock_);
   std::vector<std::string> types;
   for (const auto& publisher : getInstance().event_pubs_) {
     types.push_back(publisher.first);
@@ -763,6 +1020,7 @@ std::vector<std::string> EventFactory::publisherTypes() {
 }
 
 std::vector<std::string> EventFactory::subscriberNames() {
+  WriteLock lock(getInstance().factory_lock_);
   std::vector<std::string> names;
   for (const auto& subscriber : getInstance().event_subs_) {
     names.push_back(subscriber.first);
@@ -787,37 +1045,42 @@ void EventFactory::end(bool join) {
     }
   }
 
-  // A small cool off helps OS API event publisher flushing.
-  if (!FLAGS_disable_events) {
-    ::usleep(400);
-    ef.threads_.clear();
-  }
+  {
+    WriteLock lock(getInstance().factory_lock_);
+    // A small cool off helps OS API event publisher flushing.
+    if (!FLAGS_disable_events) {
+      ef.threads_.clear();
+    }
 
-  // Threads may still be executing, when they finish, release publishers.
-  ef.event_pubs_.clear();
-  ef.event_subs_.clear();
+    // Threads may still be executing, when they finish, release publishers.
+    ef.event_pubs_.clear();
+    ef.event_subs_.clear();
+  }
 }
 
 void attachEvents() {
-  const auto& publishers = Registry::all("event_publisher");
+  const auto& publishers = RegistryFactory::get().plugins("event_publisher");
   for (const auto& publisher : publishers) {
     EventFactory::registerEventPublisher(publisher.second);
   }
 
-  const auto& subscribers = Registry::all("event_subscriber");
+  const auto& subscribers = RegistryFactory::get().plugins("event_subscriber");
   for (const auto& subscriber : subscribers) {
+    if (subscriber.first.find("_events") == std::string::npos ||
+        subscriber.first.find("_events") + 7 != subscriber.first.size()) {
+      LOG(ERROR) << "Error registering subscriber: " << subscriber.first
+                 << ": Must use a '_events' suffix";
+      continue;
+    }
+
     auto status = EventFactory::registerEventSubscriber(subscriber.second);
     if (!status.ok()) {
-      LOG(INFO) << "Error registering subscriber: " << subscriber.first << ": "
-                << status.getMessage();
+      VLOG(1) << "Error registering subscriber: " << subscriber.first << ": "
+              << status.getMessage();
     }
   }
 
-  // Configure the event publishers the first time they load.
-  // Subsequent configuration updates will update the subscribers followed
-  // by the publishers.
-  if (!FLAGS_disable_events) {
-    Registry::registry("event_publisher")->configure();
-  }
+  // Configure the event publishers and subscribers.
+  EventFactory::configUpdate();
 }
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,24 +8,36 @@
  *
  */
 
-#include <vector>
 #include <string>
+#include <vector>
 
 #include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem/path.hpp>
 
 #include <osquery/core.h>
+#include <osquery/filesystem.h>
 #include <osquery/logger.h>
 #include <osquery/tables.h>
-#include <osquery/filesystem.h>
+
+#include "osquery/core/conversions.h"
+#include "osquery/filesystem/fileops.h"
+
+namespace fs = boost::filesystem;
 
 namespace osquery {
 namespace tables {
 
+#ifndef WIN32
+fs::path kEtcProtocols = "/etc/protocols";
+#else
+fs::path kEtcProtocols = (getSystemRoot() / "system32\\drivers\\etc\\protocol");
+#endif
+
 QueryData parseEtcProtocolsContent(const std::string& content) {
   QueryData results;
 
-  for (const auto& line : split(content, "\n")) {
+  for (const auto& line : osquery::split(content, "\n")) {
     // Empty line or comment.
     if (line.size() == 0 || boost::starts_with(line, "#")) {
       continue;
@@ -35,12 +47,12 @@ QueryData parseEtcProtocolsContent(const std::string& content) {
     // [1]: [comment part1]
     // [2]: [comment part2]
     // [n]: [comment partn]
-    auto protocol_comment = split(line, "#");
+    auto protocol_comment = osquery::split(line, "#");
 
     // [0]: name
     // [1]: protocol_number
     // [2]: alias
-    auto protocol_fields = split(protocol_comment[0]);
+    auto protocol_fields = osquery::split(protocol_comment[0]);
     if (protocol_fields.size() < 2) {
       continue;
     }
@@ -66,11 +78,11 @@ QueryData parseEtcProtocolsContent(const std::string& content) {
 
 QueryData genEtcProtocols(QueryContext& context) {
   std::string content;
-  auto s = osquery::forensicReadFile("/etc/protocols", content);
+  auto s = readFile(kEtcProtocols, content);
   if (s.ok()) {
     return parseEtcProtocolsContent(content);
   } else {
-    TLOG << "Error reading /etc/protocols: " << s.toString();
+    TLOG << "Error reading " << kEtcProtocols << ": " << s.toString();
     return {};
   }
 }

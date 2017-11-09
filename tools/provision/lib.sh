@@ -1,468 +1,334 @@
 #!/usr/bin/env bash
 
-#  Copyright (c) 2014, Facebook, Inc.
+#  Copyright (c) 2014-present, Facebook, Inc.
 #  All rights reserved.
 #
 #  This source code is licensed under the BSD-style license found in the
 #  LICENSE file in the root directory of this source tree. An additional grant
 #  of patent rights can be found in the PATENTS file in the same directory.
 
-function install_gcc() {
-  SOURCE=gcc-4.8.4
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-  TARGET=/opt/osquery/gcc
+# 1: Path to install brew into
+# 2: Linux or Darwin
+function setup_brew() {
+  DEPS="$1"
+  BREW_TYPE="$2"
+  ACTION="$3"
 
-  if provision gcc $TARGET/bin/gcc4.8.4; then
-    log "compiling a gcc toolchain, this may take a while..."
-    TARGET_SOURCE=$SOURCE
+  if [[ "$BREW_TYPE" == "linux" ]]; then
+    BREW_REPO=$LINUXBREW_REPO
+    BREW_COMMIT=$LINUXBREW_BREW
+    CORE_COMMIT=$LINUXBREW_CORE
+    CORE_REPO=$LINUXBREW_CORE_REPO
+  else
+    BREW_REPO=$HOMEBREW_REPO
+    BREW_COMMIT=$HOMEBREW_BREW
+    CORE_COMMIT=$HOMEBREW_CORE
+    CORE_REPO=$HOMEBREW_CORE_REPO
+  fi
 
-    # GCC-dependency: GMP
-    TARBALL=gmp-6.0.0a.tar.gz
-    URL=$DEPS_URL/$TARBALL
-    SOURCE=gmp-6.0.0
-    if provision gmp $WORKING_DIR/$TARGET_SOURCE/gmp/README; then
-      log "Moving gmp sources into $TARGET_SOURCE"
-      cp -R $SOURCE $TARGET_SOURCE/gmp
+  # Checkout new brew in local deps dir
+  if [[ ! -d "$DEPS/.git" ]]; then
+    log "setting up new brew in $DEPS"
+    git clone $BREW_REPO "$DEPS"
+  elif [[ ! "$ACTION" = "bottle" ]]; then
+    log "checking for updates to brew"
+    git fetch origin > /dev/null
+    git reset --hard origin/master > /dev/null
+    git clean -f
+  fi
+
+  # Reset to a deterministic checkout of brew.
+  git reset --hard $BREW_COMMIT
+
+  # Create a local cache directory
+  mkdir -p "$DEPS/.cache"
+
+  # Always update the location of the local tap link.
+  log "refreshing local tap: osquery-local"
+
+  TAPS="$DEPS/Library/Taps/"
+  mkdir -p "$TAPS/osquery/"
+
+  FORMULA_TAP="$TAPS/osquery/homebrew-osquery-local"
+  if [[ -L "$FORMULA_TAP" ]]; then
+    rm -f "$FORMULA_TAP"
+  fi
+  ln -sf "$FORMULA_DIR" "$FORMULA_TAP"
+
+  export HOMEBREW_NO_ANALYTICS_THIS_RUN=1
+  export HOMEBREW_NO_AUTO_UPDATE=1
+  export HOMEBREW_CACHE="$DEPS/.cache/"
+  export HOMEBREW_MAKE_JOBS=$THREADS
+  export HOMEBREW_NO_EMOJI=1
+  export HOMEBREW_BOTTLE_ARCH=core2
+  export BREW="$DEPS/bin/brew"
+
+  # Grab full clone to perform a pin
+  if [[ ! "$ACTION" = "bottle" ]]; then
+    log "installing and updating Homebrew core"
+    # Using a manual tap below, see: Homebrew/homebrew-core#19221
+    # $BREW tap homebrew/core --full
+    # (cd $TAPS/homebrew/homebrew-core && git pull > /dev/null && \
+    #     git reset --hard $CORE_COMMIT)
+
+    # This manually checks/clones/pulls the homebrew-core repo.
+    if [[ ! -d "$TAPS/homebrew/homebrew-core/.git" ]]; then
+      mkdir -p $TAPS/homebrew
+      (cd $TAPS/homebrew; git clone $CORE_REPO)
+    else
+      (cd $TAPS/homebrew/homebrew-core; git pull > /dev/null)
     fi
+    (cd $TAPS/homebrew/homebrew-core; git reset --hard $CORE_COMMIT)
+  fi
 
-    # GCC-dependency: MPFR
-    TARBALL=mpfr-3.1.2.tar.gz
-    URL=$DEPS_URL/$TARBALL
-    SOURCE=mpfr-3.1.2
-    if provision mpfr $WORKING_DIR/$TARGET_SOURCE/mpfr/README; then
-      log "Moving mpfr sources into $TARGET_SOURCE"
-      cp -R $SOURCE $TARGET_SOURCE/mpfr
+  # Create a 'legacy' mirror.
+  if [[ -L "$DEPS/legacy" ]]; then
+    # Backwards compatibility for legacy environment.
+    rm -f "$DEPS/legacy"
+    mkdir -p "$DEPS/legacy"
+  elif [[ ! -d "$DEPS/legacy" ]]; then
+    mkdir -p "$DEPS/legacy/lib"
+  fi
+
+  # Fix for python linking.
+  mkdir -p "$DEPS/lib/python2.7/site-packages"
+}
+
+# json_attributes JSON [ATTRIBUTE_PATH, ...]
+#   1: JSON blob
+#   N: print lines for desired attributes
+function json_attributes() {
+  CMD="import json,sys;obj=json.load(sys.stdin)"
+  CMD="$CMD;${@:2}"
+
+  RESULT=`(echo "${1}" | python -c "${CMD}") 2>/dev/null || echo 'Error'`
+  echo $RESULT
+}
+
+function set_deps_compilers() {
+  if [[ "$1" = "gcc" ]]; then
+    export CC="$DEPS/bin/gcc"
+    export CXX="$DEPS/bin/g++"
+  elif [[ -f "$DEPS/bin/clang" ]]; then
+    export CC="$DEPS/bin/clang"
+    export CXX="$DEPS/bin/clang++"
+  else
+    unset CC
+    unset CXX
+  fi
+}
+
+function brew_clear_cache() {
+  if [[ ! -z "$OSQUERY_CLEAR_CACHE" ]]; then
+    log "clearing dependency cache"
+    rm -rf "$DEPS/.cache/*"
+  fi
+}
+
+# local_brew_package TYPE NAME [ARGS, ...]
+#   1: tool/dependency/link/upstream/upstream-link
+#   2: formula name
+#   N: arguments to install
+function brew_internal() {
+  TYPE="$1"
+  TOOL="$2"
+  shift
+  shift
+
+  FORMULA="$TOOL"
+  INFO=`$BREW info --json=v1 "${FORMULA}"`
+
+  RESULTS=$(json_attributes "$INFO" \
+    'print(obj[0]["installed"][0]["version"] if len(obj[0]["installed"]) > 0 else "None");' \
+    'print(obj[0]["versions"]["stable"]);' \
+    'print(obj[0]["revision"]);' \
+    'print(obj[0]["linked_keg"] if obj[0]["linked_keg"] is not None else "None")')
+  read -r -a RESULTS <<< "$RESULTS"
+
+  INSTALLED="${RESULTS[0]}"
+  STABLE="${RESULTS[1]}"
+  REVISION="${RESULTS[2]}"
+  LINKED="${RESULTS[3]}"
+
+  if [[ ! "$REVISION" = "0" ]]; then
+    STABLE="${STABLE}_${REVISION}"
+  fi
+
+  # Add build arguments depending on requested from-source or default build.
+  ARGS="$@"
+
+  if [[ "$TYPE" = "uninstall" ]]; then
+    if [[ ! "$INSTALLED" = "None" ]]; then
+      log "brew package $TOOL uninstalling version: ${STABLE}"
+      $BREW uninstall --force "${FORMULA}"
     fi
+    return
+  fi
 
-    # GCC-dependency: MPC
-    TARBALL=mpc-1.0.3.tar.gz
-    URL=$DEPS_URL/$TARBALL
-    SOURCE=mpc-1.0.3
-    if provision mpc $WORKING_DIR/$TARGET_SOURCE/mpc/README; then
-      log "Moving mpc sources into $TARGET_SOURCE"
-      cp -R $SOURCE $TARGET_SOURCE/mpc
+  # Configure additional arguments if installing from a local formula.
+  POSTINSTALL=0
+  ARGS="$ARGS --ignore-dependencies --env=std"
+  if [[ "$FORMULA" == *"osquery"* ]]; then
+    if [[ -z "$OSQUERY_BUILD_DEPS" ]]; then
+      ARGS="$ARGS --force-bottle"
+    else
+      ARGS="$ARGS --build-bottle"
+      POSTINSTALL=1
     fi
-
-    sudo mkdir -p $TARGET
-    pushd $TARGET_SOURCE
-    ./configure \
-      --disable-checking \
-      --enable-languages=c,c++ \
-      --disable-multilib \
-      --disable-multiarch \
-      --enable-shared \
-      --enable-threads=posix \
-      --program-suffix=4.8.4 \
-      --without-included-gettext \
-      --prefix=$TARGET
-    make -j $THREADS
-    sudo make install
-
-    [ -L /usr/bin/gcc ] && sudo unlink /usr/bin/gcc
-    [ -L /usr/bin/g++ ] && sudo unlink /usr/bin/g++
-    sudo ln -sf $TARGET/bin/gcc4.8.4 /usr/bin/gcc
-    sudo ln -sf $TARGET/bin/g++4.8.4 /usr/bin/g++
-
-    sudo mkdir -p /usr/lib64
-    sudo ln -sf $TARGET/lib64/libstdc++.so.6.0.19 /usr/lib64/libstdc++.so.6.0.19
-    sudo ln -sf $TARGET/lib64/libstdc++.so.6.0.19 /usr/lib64/libstdc++.so.6
-    popd
-  fi
-}
-
-function install_cmake() {
-  SOURCE=cmake-3.2.1
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision cmake /usr/local/bin/cmake; then
-    pushd $SOURCE
-    ./bootstrap --prefix=/usr/local/
-    # Note: this sometimes fails with an error about a missing libncurses
-    # The solution is to run make deps again.
-    CC="$CC" CXX="$CXX" make -j $THREADS
-    sudo make install
-    popd
-  fi
-}
-
-function install_sleuthkit() {
-  SOURCE=sleuthkit-sleuthkit-4.2.0
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision sleuthkit /usr/local/lib/libtsk.a; then
-    pushd $SOURCE
-    ./bootstrap
-    ./configure --prefix=/usr/local --without-afflib \
-      --disable-dependency-tracking --disable-java CFLAGS="$CFLAGS"
-    pushd tsk
-    CC="$CC" CXX="$CXX" make -j $THREADS
-    sudo make install
-    popd
-    sudo make install-nobase_includeHEADERS
-    popd
-  fi
-}
-
-function install_thrift() {
-  TARBALL=thrift-0.9.3.tar.gz
-  URL=$DEPS_URL/$TARBALL
-  SOURCE=thrift-0.9.3
-
-  if provision thrift /usr/local/lib/libthrift.a; then
-    pushd $SOURCE
-    ./bootstrap.sh
-    ./configure CFLAGS="$CFLAGS" \
-      --with-cpp=yes \
-      --with-python=yes \
-      --with-ruby=no \
-      --with-go=no \
-      --with-erlang=no \
-      --with-java=no \
-      --with-php=no \
-      --with-qt4=no \
-      --with-qt=no
-    CC="$CC" CXX="$CXX" make -j $THREADS
-    sudo make install
-    popd
-  fi
-}
-
-function install_rocksdb() {
-  VERSION=4.1
-  TARBALL=rocksdb-$VERSION.tar.gz
-  URL=$DEPS_URL/$TARBALL
-  SOURCE=rocksdb-rocksdb-$VERSION
-
-  if provision rocksdb /usr/local/lib/librocksdb_lite.a; then
-    if [[ ! -f rocksdb-rocksdb-$VERSION/librocksdb_lite.a ]]; then
-      if [[ $FAMILY = "debian" ]]; then
-        CLANG_INCLUDE="-I/usr/include/clang/3.4/include"
-      elif [[ $FAMILY = "redhat" ]]; then
-        CLANG_VERSION=`clang --version | grep version | cut -d" " -f3`
-        CLANG_INCLUDE="-I/usr/lib/clang/$CLANG_VERSION/include"
-      fi
-      pushd $SOURCE
-      if [[ $OS = "freebsd" ]]; then
-        CC=cc
-        CXX=c++
-        MAKE=gmake
-      else
-        MAKE=make
-      fi
-      PORTABLE=1 OPT="-DROCKSDB_LITE=1" LIBNAME=librocksdb_lite CC="$CC" CXX="$CXX" \
-        $MAKE -j $THREADS static_lib CFLAGS="$CLANG_INCLUDE $CFLAGS"
-      popd
+    if [[ "$TYPE" = "dependency" ]]; then
+      ARGS="$ARGS --cc=clang"
     fi
-    sudo cp rocksdb-rocksdb-$VERSION/librocksdb_lite.a /usr/local/lib
-    sudo cp -R rocksdb-rocksdb-$VERSION/include/rocksdb /usr/local/include
-  fi
-}
-
-function install_snappy() {
-  SOURCE=snappy-1.1.1
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision snappy /usr/local/include/snappy.h; then
-    pushd $SOURCE
-    CC="$CC" CXX="$CXX" ./configure --with-pic --enable-static
-    if [[ ! -f .libs/libsnappy.a ]]; then
-      make -j $THREADS
+    if [[ ! -z "$DEBUG" ]]; then
+      ARGS="$ARGS -vd"
     fi
-    sudo make install
-    popd
+    if [[ ! -z "$VERBOSE" ]]; then
+      ARGS="$ARGS -v"
+    fi
+  else
+    ARGS="$ARGS --force-bottle"
+  fi
+
+  # If linking, only link if not linked and return immediately.
+  if [[ "$TYPE" = "link" ]]; then
+    if [[ ! "$LINKED" = "$STABLE" ]]; then
+      $BREW link --force "${FORMULA}"
+    fi
+    return
+  fi
+
+  if [[ "$TYPE" = "unlink" ]]; then
+    if [[ "$LINKED" = "$STABLE" ]]; then
+      $BREW unlink --force "${FORMULA}"
+    fi
+    return
+  fi
+
+  export HOMEBREW_OPTIMIZATION_LEVEL=-Os
+  if [[ ! -z "$OSQUERY_BUILD_BOTTLES" && "$FORMULA" == *"osquery"* ]]; then
+    $BREW bottle --skip-relocation "${FORMULA}"
+  elif [[ "$TYPE" = "clean" ]]; then
+    if [[ "${STABLE}" = "None_None" ]]; then
+      log "brew cleaning older or forward-dependent version of $TOOL: ${INSTALLED}"
+      $BREW uninstall --ignore-dependencies "${FORMULA}"
+    elif [[ ! "${INSTALLED}" = "${STABLE}" && ! "${INSTALLED}" = "None" ]]; then
+      log "brew cleaning older version of $TOOL: ${INSTALLED}"
+      $BREW uninstall --ignore-dependencies "${FORMULA}"
+    fi
+  elif [[ "${INSTALLED}" = "None" ]]; then
+    log "brew package $TOOL installing new version: ${STABLE}"
+    $BREW install $ARGS "${FORMULA}"
+  elif [[ ! "${INSTALLED}" = "${STABLE}" || "${FROM_BOTTLE}" = "true" ]]; then
+    log "brew package $TOOL upgrading to new version: ${STABLE}"
+    $BREW uninstall --ignore-dependencies "${FORMULA}"
+    $BREW install $ARGS "${FORMULA}"
+  else
+    log "brew package $TOOL is already installed: ${STABLE}"
+  fi
+
+  if [[ "$POSTINSTALL" = "1" ]]; then
+    $BREW postinstall "${FORMULA}"
   fi
 }
 
-function install_cppnetlib() {
-  SOURCE=cpp-netlib-0.11.2
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
+function brew_tool() {
+  brew_internal "tool" $@
+}
 
-  if provision cppnetlib /usr/local/include/boost/network.hpp; then
-    pushd $SOURCE
-    mkdir -p build
-    pushd build
-    CC="$CC" CXX="$CXX" cmake -DCMAKE_CXX_FLAGS="$CFLAGS" \
-      -DCPP-NETLIB_BUILD_EXAMPLES=False -DCPP-NETLIB_BUILD_TESTS=False  ..
-    make -j $THREADS
-    sudo make install
-    popd
-    popd
+function brew_dependency() {
+  # Essentially uses clang instead of GCC.
+  set_deps_compilers clang
+  brew_internal "dependency" $@
+  if [[ -f "$DEPS/bin/gcc" ]]; then
+    set_deps_compilers gcc
   fi
 }
 
-function install_yara() {
-  SOURCE=yara-3.4.0
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
+function brew_link() {
+  brew_internal "link" $@
+}
 
-  if provision yara /usr/local/lib/libyara.a; then
-    pushd $SOURCE
-    ./bootstrap.sh
-    CC="$CC" CXX="$CXX" ./configure --with-pic --enable-static
-    make -j $THREADS
-    sudo make install
-    popd
+function brew_unlink() {
+  brew_internal "unlink" $@
+}
+
+function brew_uninstall() {
+  brew_internal "uninstall" $@
+}
+
+function brew_clean() {
+  # Remove older versions if installed.
+  brew_internal "clean" $@
+}
+
+function brew_bottle() {
+  FORMULA=$1
+  $BREW bottle --skip-relocation "${FORMULA}"
+
+  INFO=`$BREW info --json=v1 "${FORMULA}"`
+  INSTALLED=$(json_attributes "${INFO}" \
+    'print(obj[0]["installed"][0]["version"]);')
+
+  ARIN=(${FORMULA//// })
+  TOOL=${ARIN[2]}
+
+  FORMULA_FILE=${FORMULA_DIR}/${TOOL}.rb
+  if [[ ! -f "$FORMULA_FILE" ]]; then
+    log "[!] cannot install bottle hash into $FORMULA_FILE"
+    return
+  fi
+
+  HASH=$(shasum -a 256 $DEPS_DIR/${TOOL}-${INSTALLED}* | awk '{print $1}')
+
+  log "installing $HASH into $FORMULA_FILE"
+  if [[ "$BREW_TYPE" = "linux" ]]; then
+    SED="sed -i "
+    SUFFIX=$LINUX_BOTTLE_SUFFIX
+  else
+    SED="sed -i .orig "
+    SUFFIX=$DARWIN_BOTTLE_SUFFIX
+  fi
+
+  $SED "s/sha256 \"\\(.*\\)\" => :${SUFFIX}/sha256 \"${HASH}\" => :${SUFFIX}/g" $FORMULA_FILE
+  cp $DEPS_DIR/${TOOL}-${INSTALLED}.${SUFFIX}.bottle.tar.gz $CURRENT_DIR
+}
+
+function brew_postinstall() {
+  TOOL=$1
+  if [[ ! -z "$OSQUERY_BUILD_DEPS" ]]; then
+    $BREW postinstall "${TOOL}"
   fi
 }
 
-function install_openssl() {
-  SOURCE=openssl-1.0.2e
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision openssl /usr/local/lib/libssl.so.1.0.0; then
-    pushd $SOURCE
-    CC="$CC" CXX="$CXX" ./config --prefix=/usr/local --openssldir=/etc/ssl \
-      --libdir=lib shared zlib-dynamic enable-shared
-    make -j $THREADS
-    sudo make install
-    popd
-  fi
-}
-
-function install_bison() {
-  SOURCE=bison-2.5
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision bison /usr/local/bin/bison; then
-    pushd $SOURCE
-    CC="$CC" CXX="$CXX" ./configure --prefix=/usr/local \
-      --with-libiconv-prefix=/usr/local/libiconv/
-    make -j $THREADS
-    sudo make install
-    popd
-  fi
-}
-
-function install_boost() {
-  SOURCE=boost_1_55_0
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision boost /usr/local/lib/libboost_thread.a; then
-    pushd $SOURCE
-    ./bootstrap.sh
-    sudo ./b2 --with=all -j $THREADS toolset="gcc" install || true
-    sudo ldconfig
-    popd
-  fi
-}
-
-function install_gflags() {
-  TARBALL=v2.1.1.tar.gz
-  URL=$DEPS_URL/$TARBALL
-  SOURCE=gflags-2.1.1
-
-  if provision gflags /usr/local/lib/libgflags.a; then
-    pushd $SOURCE
-    cmake -DCMAKE_CXX_FLAGS="$CFLAGS" -DGFLAGS_NAMESPACE:STRING=google .
-    CC="$CC" CXX="$CXX" make -j $THREADS
-    sudo make install
-    popd
-  fi
-}
-
-function install_google_benchmark() {
-  SOURCE=benchmark-0.1.0
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision benchmark /usr/local/lib/libbenchmark.a; then
-    pushd $SOURCE
-    mkdir -p build
-    pushd build
-    cmake -DCMAKE_CXX_FLAGS="$CFLAGS" ..
-    CC="$CC" CXX="$CXX" make -j $THREADS
-    sudo make install
-    popd
-    popd
-  fi
-}
-
-function install_iptables_dev() {
-  SOURCE=iptables-1.4.21
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision iptables_dev /usr/local/lib/libip4tc.a; then
-    pushd $SOURCE
-    ./configure --disable-shared --prefix=/usr/local
-    pushd libiptc
-    CC="$CC" CXX="$CXX" make -j $THREADS
-    sudo make install
-    popd
-    pushd include
-    sudo make install
-    popd
-    popd
-  fi
-}
-
-function install_libcryptsetup() {
-  SOURCE=cryptsetup-1.6.7
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision libcryptsetup /usr/local/lib/libcryptsetup.a; then
-    pushd $SOURCE
-    ./autogen.sh --prefix=/usr/local --enable-static --disable-kernel_crypto
-    ./configure --prefix=/usr/local --enable-static --disable-kernel_crypto
-    pushd lib
-    make -j $THREADS
-    sudo make install
-    popd
-    popd
-  fi
-}
-
-function install_autoconf() {
-  SOURCE=autoconf-2.69
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  # Two methods for provisioning autoconf (1) install, (2) upgrade
-  PROVISION_AUTOCONF=false
-  if provision autoconf /usr/bin/autoconf; then
-    PROVISION_AUTOCONF=true
-  elif [[ `autoconf -V | head -1 | awk '{print $4}' | sed 's/\.//g'` -lt "269" ]]; then
-    provision autoconf
-    PROVISION_AUTOCONF=true
+function deps_version() {
+  DEPS_DIR=$1
+  VERSION=$2
+  CURRENT="0"
+  if [[ -f "$DEPS_DIR/DEPS_VERSION" ]]; then
+    CURRENT=$(cat $DEPS_DIR/DEPS_VERSION || echo -n '0')
   fi
 
-  if $PROVISION_AUTOCONF; then
-    pushd $SOURCE
-    ./configure --prefix=/usr
-    CC="$CC" CXX="$CXX" make -j $THREADS
-    sudo make install
-    popd
-  fi
-}
-
-function install_automake() {
-  SOURCE=automake-1.14
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision automake /usr/bin/automake; then
-    pushd $SOURCE
-    ./bootstrap.sh
-    ./configure --prefix=/usr
-    # Version 1.14 of automake fails to build with more than one thread
-    CC="$CC" CXX="$CXX" make -j 1
-    sudo make install
-    popd
-  fi
-}
-
-function install_libtool() {
-  SOURCE=libtool-2.4.5
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision libtool /usr/bin/libtool; then
-    pushd $SOURCE
-    ./configure --prefix=/usr
-    make -j $THREADS
-    sudo make install
-    popd
-  fi
-}
-
-function install_pkgconfig() {
-  SOURCE=pkg-config-0.28
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision pkg-config /usr/bin/pkg-config; then
-    pushd $SOURCE
-    sudo rm /usr/bin/x86_64-unknown-linux-gnu-pkg-config || true
-    ./configure --with-internal-glib --prefix=/usr
-    make -j $THREADS
-    sudo make install
-    popd
-  fi
-}
-
-function install_udev_devel_095() {
-  SOURCE=udev-095
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision udev-095 /usr/local/lib/libudev.a; then
-    pushd $SOURCE
-    CC="$CC" CXX="$CXX" make libudev.a
-    sudo cp libudev.a /usr/local/lib/
-    popd
-  fi
-}
-
-function install_pip() {
-  PYTHON_EXECUTABLE=$1
-  URL=$DEPS_URL/get-pip.py
-
-  if [[ ! -e /usr/bin/pip ]]; then
-    curl $URL | sudo $PYTHON_EXECUTABLE -
-  fi
-}
-
-function install_ruby() {
-  SOURCE=ruby-1.8.7-p370
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision ruby-1.8.7 /usr/local/bin/ruby; then
-    pushd $SOURCE
-    ./configure --prefix=/usr/local
-    CC="$CC" CXX="$CXX" make -j $THREADS
-    sudo make install
-    popd
+  if [[ "$VERSION" != "$CURRENT" && ! "$CURRENT" = "0" ]]; then
+    log "dependency version changed removing existing dependencies"
+    do_sudo rm -rf "$DEPS_DIR/*"
   fi
 
-  SOURCE=rubygems-1.8.24
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision rubygems-1.8.24 /usr/local/bin/gem; then
-    pushd $SOURCE
-    sudo ruby setup.rb
-    popd
-  fi
-}
-
-function install_libaptpkg() {
-  SOURCE=apt-0.8.16-12.10.22
-  TARBALL=$SOURCE.tar.gz
-  URL=$DEPS_URL/$TARBALL
-
-  if provision libaptpkg /usr/local/lib/libapt-pkg.a; then
-    pushd $SOURCE
-    mkdir -p build
-    pushd build
-    ../configure --prefix=/usr/local
-    make -j $THREADS STATICLIBS=1 library
-    sudo cp bin/libapt-pkg.so.4.12.0 /usr/local/lib/
-    sudo ln -sf /usr/local/lib/libapt-pkg.so.4.12.0 /usr/local/lib/libapt-pkg.so
-    sudo cp bin/libapt-pkg.a /usr/local/lib/
-    sudo mkdir -p /usr/local/include/apt-pkg/
-    sudo cp include/apt-pkg/*.h /usr/local/include/apt-pkg/
-    popd
-    popd
+  if [[ -d "$DEPS_DIR/Cellar" ]]; then
+    INSTALLED_COUNT=$(ls -l $DEPS_DIR/Cellar| grep -v ^l | wc -l)
+    if [[ "$CURRENT" = "0" && ! $INSTALLED_COUNT = "0" ]]; then
+      log "dependencies are unversioned removing existing dependencies"
+      do_sudo rm -rf "$DEPS_DIR/*"
+    fi
   fi
 }
 
 function package() {
   if [[ $FAMILY = "debian" ]]; then
-    if [[ -n "$(dpkg --get-selections | grep $1)" ]]; then
+    INSTALLED=`dpkg-query -W -f='${Status} ${Version}\n' $1 || true`
+    if [[ -n "$INSTALLED" && ! "$INSTALLED" = *"unknown ok not-installed"* ]]; then
       log "$1 is already installed. skipping."
     else
       log "installing $1"
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install $1 -y --no-install-recommends
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install $1 -y -q --no-install-recommends
     fi
   elif [[ $FAMILY = "redhat" ]]; then
     if [[ ! -n "$(rpm -V $1)" ]]; then
@@ -494,8 +360,13 @@ function package() {
         HOMEBREW_ARGS="--build-bottle --with-static"
       elif [[ $1 = "libressl" ]]; then
         HOMEBREW_ARGS="--build-bottle"
+      elif [[ $1 = "aws-sdk-cpp" ]]; then
+        HOMEBREW_ARGS="--build-bottle --with-static --without-http-client"
       fi
-      brew install -v $HOMEBREW_ARGS $1 || brew upgrade -v $HOMEBREW_ARGS $@
+      if [[ "$2" = "devel" ]]; then
+        HOMEBREW_ARGS="${HOMEBREW_ARGS} --devel"
+      fi
+      brew install -v $HOMEBREW_ARGS $1 || brew upgrade -v $HOMEBREW_ARGS $1
     fi
   elif [[ $OS = "freebsd" ]]; then
     if pkg info -q $1; then
@@ -504,72 +375,26 @@ function package() {
       log "installing $1"
       sudo pkg install -y $1
     fi
-  fi
-}
-
-function remove_package() {
-  if [[ $FAMILY = "debian" ]]; then
-    if [[ -n "$(dpkg --get-selections | grep $1)" ]]; then
-      log "removing $1"
-      sudo apt-get remove $1 -y
+  elif [ $OS = "arch" ] || [ $OS="manjaro" ]; then
+    if pacman -Qq $1 >/dev/null; then
+      log "$1 is already installed. skipping."
     else
-      log "Removing: $1 is not installed. skipping."
-    fi
-  elif [[ $FAMILY = "redhat" ]]; then
-    if [[ -n "$(rpm -qa | grep $1)" ]]; then
-      log "removing $1"
-      sudo yum remove $1 -y
-    else
-      log "Removing: $1 is not installed. skipping."
-    fi
-  elif [[ $OS = "darwin" ]]; then
-    if [[ -n "$(brew list | grep $1)" ]]; then
-      log "removing $1"
-      brew uninstall $1
-    else
-      log "Removing: $1 is not installed. skipping."
-    fi
-  elif [[ $OS = "freebsd" ]]; then
-    if ! pkg info -q $1; then
-      log "removing $1"
-      sudo pkg delete -y $1
-    else
-      log "Removing: $1 is not installed. skipping."
+      log "installing $1"
+      sudo pacman -S --noconfirm $1
     fi
   fi
 }
 
-function gem_install() {
-  if [[ -n "$(gem list | grep $1)" ]]; then
-    log "$1 is already installed. skipping."
-  else
-    sudo gem install $@
-  fi
-}
-
-function provision() {
-  local _name=$1
-  local _install_check=$2
-
-  if [[ ! -f $_install_check ]]; then
-    log "$_name is not installed/provisioned. installing..."
-    if [[ ! -f $TARBALL ]]; then
-      log "$_name has not been downloaded. downloading..."
-      wget "$URL"
-    else
-      log "$_name is already downloaded. skipping download."
-    fi
-    if [[ ! -d $SOURCE ]]; then
-      log "$_name has not been extracted. extracting..."
-      tar -xzf $TARBALL
-    fi
-    return 0
-  fi
-  log "$_name is already installed. skipping provision."
-  return 1
+function ports() {
+  PKG="$1"
+  log "building port $1"
+  (cd /usr/ports/$1; do_sudo make deinstall)
+  (cd /usr/ports/$1; do_sudo make install clean BATCH=yes)
 }
 
 function check() {
+  CMD="$1"
+  DISTRO_BUILD_DIR="$2"
   platform OS
 
   if [[ $OS = "darwin" ]]; then
@@ -580,13 +405,13 @@ function check() {
     HASH=`sha1sum "$0" | awk '{print $1}'`
   fi
 
-  if [[ "$1" = "build" ]]; then
-    echo $HASH > "$2/.provision"
+  if [[ "$CMD" = "build" ]]; then
+    echo $HASH > "build/$DISTRO_BUILD_DIR/.provision"
     if [[ ! -z "$SUDO_USER" ]]; then
-      chown $SUDO_USER "$2/.provision" > /dev/null 2>&1 || true
+      chown $SUDO_USER "build/$DISTRO_BUILD_DIR/.provision" > /dev/null 2>&1 || true
     fi
     return
-  elif [[ ! "$1" = "check" ]]; then
+  elif [[ ! "$CMD" = "check" ]]; then
     return
   fi
 
@@ -595,7 +420,7 @@ function check() {
     exit 1
   fi
 
-  CHECKPOINT=`cat $2/.provision 2>&1 &`
+  CHECKPOINT=`cat $DISTRO_BUILD_DIR/.provision 2>&1 &`
   if [[ ! $HASH = $CHECKPOINT ]]; then
     echo "Requested dependencies may have changed, run: make deps"
     exit 1

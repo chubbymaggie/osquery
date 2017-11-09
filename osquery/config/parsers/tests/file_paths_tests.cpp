@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -13,7 +13,7 @@
 #include <osquery/config.h>
 #include <osquery/registry.h>
 
-#include "osquery/core/test_util.h"
+#include "osquery/tests/test_util.h"
 
 namespace osquery {
 
@@ -25,11 +25,16 @@ class FilePathsConfigParserPluginTests : public testing::Test {
 
     // Construct a config map, the typical output from `Config::genConfig`.
     config_data_["awesome"] = content_;
+    Config::get().reset();
+  }
+
+  void TearDown() override {
+    Config::get().reset();
   }
 
   size_t numFiles() {
     size_t count = 0;
-    Config::getInstance().files(([&count](
+    Config::get().files(([&count](
         const std::string&, const std::vector<std::string>&) { count++; }));
     return count;
   }
@@ -44,11 +49,11 @@ TEST_F(FilePathsConfigParserPluginTests, test_get_files) {
       "config_files", "logs", "logs"};
   std::vector<std::string> categories;
   std::vector<std::string> expected_values = {
-      "/dev", "/dev/zero", "/dev/null", "/dev/random", "/dev/urandom"};
+      "/dev", "/dev/zero", "/dev/null", "/dev/random"};
   std::vector<std::string> values;
 
-  Config::getInstance().update(config_data_);
-  Config::getInstance().files(([&categories, &values](
+  Config::get().update(config_data_);
+  Config::get().files(([&categories, &values](
       const std::string& category, const std::vector<std::string>& files) {
     categories.push_back(category);
     for (const auto& file : files) {
@@ -61,22 +66,22 @@ TEST_F(FilePathsConfigParserPluginTests, test_get_files) {
 }
 
 TEST_F(FilePathsConfigParserPluginTests, test_get_file_accesses) {
-  // Assume config data has been added.
+  Config::get().update(config_data_);
   auto parser = Config::getParser("file_paths");
   auto& accesses = parser->getData().get_child("file_accesses");
   EXPECT_EQ(accesses.size(), 2U);
 }
 
 TEST_F(FilePathsConfigParserPluginTests, test_remove_source) {
-  EXPECT_GT(numFiles(), 0U);
-  Config::getInstance().removeFiles("awesome");
+  Config::get().update(config_data_);
+  Config::get().removeFiles("awesome");
   // Expect the pack's set to persist.
   // Do not call removeFiles, instead only update the pack/config content.
   EXPECT_EQ(numFiles(), 1U);
 
   // This will clear all source data for 'awesome'.
   config_data_["awesome"] = "";
-  Config::getInstance().update(config_data_);
+  Config::get().update(config_data_);
   EXPECT_EQ(numFiles(), 0U);
 }
 }

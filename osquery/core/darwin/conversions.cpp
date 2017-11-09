@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -65,7 +65,7 @@ std::string stringFromCFData(const CFDataRef& cf_data) {
 }
 
 std::string stringFromCFNumber(const CFDataRef& cf_number) {
-  return stringFromCFNumber(cf_number, kCFNumberIntType);
+  return stringFromCFNumber(cf_number, CFNumberGetType((CFNumberRef)cf_number));
 }
 
 std::string stringFromCFNumber(const CFDataRef& cf_number, CFNumberType type) {

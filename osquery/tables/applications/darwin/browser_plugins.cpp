@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -8,13 +8,16 @@
  *
  */
 
+extern "C" {
+#include <xar/xar.h>
+}
+
 #include <osquery/filesystem.h>
+#include <osquery/logger.h>
+#include <osquery/system.h>
 #include <osquery/tables.h>
 
-/// Include the "external" (not OS X provided) libarchive header.
-#include <archive.h>
-#include <archive_entry.h>
-
+#include "osquery/core/conversions.h"
 #include "osquery/tables/applications/browser_utils.h"
 #include "osquery/tables/system/system_utils.h"
 
@@ -50,16 +53,23 @@ const std::map<std::string, std::string> kSafariExtensionKeys = {
     {"CFBundleInfoDictionaryVersion", "sdk"},
     {"Description", "description"},
     {"Update Manifest URL", "update_url"},
+    {"DeveloperIdentifier", "developer_id"},
 };
 
 void genBrowserPlugin(const std::string& uid,
                       const std::string& path,
-                      QueryData& results) {
+                      QueryData& results,
+                      bool is_disabled = false) {
   Row r;
   pt::ptree tree;
 
   r["uid"] = uid;
-  if (osquery::parsePlist(path + "/Contents/Info.plist", tree).ok()) {
+  auto info_path = path + "/Contents/Info.plist";
+  // Ensure that what we're processing is actually a plug-in.
+  if (!pathExists(info_path)) {
+    return;
+  }
+  if (osquery::parsePlist(info_path, tree).ok()) {
     // Plugin did not include an Info.plist, or it was invalid
     for (const auto& it : kBrowserPluginKeys) {
       r[it.second] = tree.get(it.first, "");
@@ -73,107 +83,125 @@ void genBrowserPlugin(const std::string& uid,
     // The default case for native execution is false.
     r["native"] = "0";
   }
-
   r["path"] = path;
+  r["disabled"] = (is_disabled) ? "1" : "0";
   results.push_back(std::move(r));
 }
 
 QueryData genBrowserPlugins(QueryContext& context) {
   QueryData results;
-  std::vector<std::string> bundles;
 
-  // The caller is not requesting a JOIN against users.
-  // This is "special" logic for user data-based tables since there is a concept
-  // of system-available browser extensions.
-  if (context.constraints["uid"].notExistsOrMatches("0")) {
+  // Lambda to walk through each browser plugin and process the plist file.
+  auto enum_browser_plugins = [&results](const fs::path& path,
+                                         const std::string& uid) {
     std::vector<std::string> bundles;
-    if (listDirectoriesInDirectory(kBrowserPluginsPath, bundles).ok()) {
+    if (listDirectoriesInDirectory(path, bundles).ok()) {
       for (const auto& dir : bundles) {
-        genBrowserPlugin("0", dir, results);
+        genBrowserPlugin(uid, dir, results, false);
       }
     }
+
+    // Check if the plugin is the 'Disabled' folder.
+    std::vector<std::string> disabled_bundles;
+    auto dis_path = path / "Disabled Plug-Ins";
+    if (listDirectoriesInDirectory(dis_path, disabled_bundles).ok()) {
+      for (const auto& disabled_dir : disabled_bundles) {
+        genBrowserPlugin(uid, disabled_dir, results, true);
+      }
+    }
+  };
+
+  // The caller is not requesting a JOIN against users. This is "special" logic
+  // for user data-based tables since there is a concept of system-available
+  // browser extensions.
+  if (context.constraints["uid"].notExistsOrMatches("0")) {
+    enum_browser_plugins(kBrowserPluginsPath, "0");
   }
 
   // Iterate over each user
   auto users = usersFromContext(context);
   for (const auto& row : users) {
     if (row.count("uid") > 0 && row.count("directory") > 0) {
-      std::vector<std::string> bundles;
       auto dir = fs::path(row.at("directory")) / kBrowserPluginsPath;
-      if (listDirectoriesInDirectory(dir, bundles).ok()) {
-        for (const auto& dir : bundles) {
-          genBrowserPlugin(row.at("uid"), dir, results);
-        }
-      }
+      enum_browser_plugins(dir, row.at("uid"));
     }
   }
-
   return results;
 }
 
 inline void genSafariExtension(const std::string& uid,
+                               const std::string& gid,
                                const std::string& path,
                                QueryData& results) {
   Row r;
   r["uid"] = uid;
   r["path"] = path;
 
-  // Loop through (Plist key -> table column name) in kSafariExtensionKeys.
-  struct archive* ext = archive_read_new();
-  if (ext == nullptr) {
-    return;
-  }
-
   // Perform a dry run of the file read.
-  if (!readFile(path).ok()) {
+  if (!isReadable(path).ok()) {
     return;
   }
 
   // Finally drop privileges to the user controlling the extension.
   auto dropper = DropPrivileges::get();
-  if (!dropper->dropToParent(path)) {
+  if (!dropper->dropTo(uid, gid)) {
+    VLOG(1) << "Cannot drop privileges to UID " << uid;
     return;
   }
 
-  // Use open_file, instead of the preferred open_filename for OS X 10.9.
-  archive_read_support_format_xar(ext);
-  if (archive_read_open_filename(ext, path.c_str(), 10240) != ARCHIVE_OK) {
-    archive_read_finish(ext);
+  xar_t xar = xar_open(path.c_str(), READ);
+  if (xar == nullptr) {
+    TLOG << "Cannot open extension archive: " << path;
     return;
   }
 
-  struct archive_entry* entry = nullptr;
-  while (archive_read_next_header(ext, &entry) == ARCHIVE_OK) {
-    auto item_path = archive_entry_pathname(entry);
-    // Documentation for libarchive mentions these APIs may return NULL.
-    if (item_path == nullptr) {
-      archive_read_data_skip(ext);
-      continue;
+  xar_iter_t iter = xar_iter_new();
+  xar_file_t xfile = xar_file_first(xar, iter);
+
+  size_t max_files = 500;
+  for (size_t index = 0; index < max_files; ++index) {
+    if (xfile == nullptr) {
+      break;
     }
 
-    // Assume there is no non-root Info.
-    if (std::string(item_path).find("Info.plist") == std::string::npos) {
-      archive_read_data_skip(ext);
-      continue;
+    char* xfile_path = xar_get_path(xfile);
+    if (xfile_path == nullptr) {
+      break;
     }
 
-    // Read the decompressed Info.plist content.
-    auto content = std::string(archive_entry_size(entry), '\0');
-    archive_read_data_into_buffer(ext, &content[0], content.size());
-
-    // If the Plist can be parsed, extract important keys into columns.
-    pt::ptree tree;
-    if (parsePlistContent(content, tree).ok()) {
-      for (const auto& it : kSafariExtensionKeys) {
-        r[it.second] = tree.get(it.first, "");
+    // Clean up the allocated content ASAP.
+    std::string entry_path(xfile_path);
+    free(xfile_path);
+    if (entry_path.find("Info.plist") != std::string::npos) {
+      if (xar_verify(xar, xfile) != XAR_STREAM_OK) {
+        TLOG << "Extension info extraction failed verification: " << path;
       }
+
+      size_t size = 0;
+      char* buffer = nullptr;
+      if (xar_extract_tobuffersz(xar, xfile, &buffer, &size) != 0 ||
+          size == 0) {
+        break;
+      }
+
+      std::string content(buffer, size);
+      free(buffer);
+
+      pt::ptree tree;
+      if (parsePlistContent(content, tree).ok()) {
+        for (const auto& it : kSafariExtensionKeys) {
+          r[it.second] = tree.get(it.first, "");
+        }
+      }
+      break;
     }
-    break;
+
+    xfile = xar_file_next(iter);
   }
 
-  archive_read_close(ext);
-  archive_read_finish(ext);
-  results.push_back(std::move(r));
+  xar_iter_free(iter);
+  xar_close(xar);
+  results.push_back(r);
 }
 
 QueryData genSafariExtensions(QueryContext& context) {
@@ -182,22 +210,29 @@ QueryData genSafariExtensions(QueryContext& context) {
   // Iterate over each user
   auto users = usersFromContext(context);
   for (const auto& row : users) {
-    if (row.count("uid") > 0 && row.count("directory") > 0) {
-      auto dir = fs::path(row.at("directory")) / kSafariExtensionsPath;
-      // Check that an extensions directory exists.
-      if (!pathExists(dir).ok()) {
-        continue;
-      }
+    auto uid = row.find("uid");
+    auto gid = row.find("gid");
+    auto directory = row.find("directory");
+    if (uid == row.end() || gid == row.end() || directory == row.end()) {
+      continue;
+    }
 
-      // Glob the extension files.
-      std::vector<std::string> paths;
-      if (!resolveFilePattern(dir / kSafariExtensionsPattern, paths).ok()) {
-        continue;
-      }
+    auto dir = fs::path(directory->second) / kSafariExtensionsPath;
+    // Check that an extensions directory exists.
+    if (!pathExists(dir).ok()) {
+      continue;
+    }
 
-      for (const auto& extension_path : paths) {
-        genSafariExtension(row.at("uid"), extension_path, results);
-      }
+    // Glob the extension files.
+    std::vector<std::string> paths;
+    if (!resolveFilePattern(
+             dir / kSafariExtensionsPattern, paths, GLOB_ALL | GLOB_NO_CANON)
+             .ok()) {
+      continue;
+    }
+
+    for (const auto& extension_path : paths) {
+      genSafariExtension(uid->second, gid->second, extension_path, results);
     }
   }
 

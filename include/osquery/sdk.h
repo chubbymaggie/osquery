@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -21,7 +21,6 @@
 #include <osquery/extensions.h>
 #include <osquery/filesystem.h>
 #include <osquery/flags.h>
-#include <osquery/hash.h>
 #include <osquery/logger.h>
 #include <osquery/registry.h>
 #include <osquery/sql.h>
@@ -54,15 +53,10 @@ REGISTER_INTERNAL(ExternalSQLPlugin, "sql", "sql");
  * module call-in well defined symbol, declare their SDK constraints, then
  * use the REGISTER_MODULE call within `initModule`.
  */
-#define REGISTER_EXTERNAL(type, registry, name)                            \
-  __attribute__((constructor)) static void type##ExtensionRegistryItem() { \
-    Registry::add<type>(registry, name);                                   \
+#define REGISTER_EXTERNAL(t, r, n)                                             \
+  namespace registries {                                                       \
+  const ::osquery::registries::PI<t> k##ExtensionRegistryItem##t(r, n, false); \
   }
-
-/// Helper macro to write the `initModule` symbol without rewrites.
-#define DECLARE_MODULE(name)        \
-  extern "C" void initModule(void); \
-  __attribute__((constructor)) static void declareModule()
 
 /**
  * @brief Create an osquery extension 'module'.
@@ -80,11 +74,15 @@ REGISTER_INTERNAL(ExternalSQLPlugin, "sql", "sql");
  * The registry is again locked when the module load is complete and a well
  * known module-exported symbol is called.
  */
-#define CREATE_MODULE(name, version, min_sdk_version)         \
-  DECLARE_MODULE(name) {                                      \
-    Registry::declareModule(                                  \
-        name, version, min_sdk_version, OSQUERY_SDK_VERSION); \
-  }
+#define CREATE_MODULE(name, version, min_sdk_version)                          \
+  extern "C" EXPORT_FUNCTION void initModule(void);                            \
+  struct osquery_InternalStructCreateModule {                                  \
+    osquery_InternalStructCreateModule(void) {                                 \
+      Registry::get().declareModule(                                           \
+          name, version, min_sdk_version, OSQUERY_SDK_VERSION);                \
+    }                                                                          \
+  };                                                                           \
+  static osquery_InternalStructCreateModule osquery_internal_module_instance_;
 
 /**
  * @brief Create an osquery extension 'module', if an expression is true.
@@ -96,17 +94,21 @@ REGISTER_INTERNAL(ExternalSQLPlugin, "sql", "sql");
  * And example use includes checking if a process environment variable is
  * defined. If defined the module is declared.
  */
-#define CREATE_MODULE_IF(expr, name, version, min_sdk_version)  \
-  DECLARE_MODULE(name) {                                        \
-    if ((expr)) {                                               \
-      Registry::declareModule(                                  \
-          name, version, min_sdk_version, OSQUERY_SDK_VERSION); \
-    }                                                           \
-  }
+#define CREATE_MODULE_IF(expr, name, version, min_sdk_version)                 \
+  extern "C" EXPORT_FUNCTION void initModule(void);                            \
+  struct osquery_InternalStructCreateModule {                                  \
+    osquery_InternalStructCreateModule(void) {                                 \
+      if ((expr)) {                                                            \
+        Registry::get().declareModule(                                         \
+            name, version, min_sdk_version, OSQUERY_SDK_VERSION);              \
+      }                                                                        \
+    }                                                                          \
+  };                                                                           \
+  static osquery_InternalStructCreateModule osquery_internal_module_instance_;
 
 /// Helper replacement for REGISTER, used within extension modules.
-#define REGISTER_MODULE(type, registry, name) \
-  auto type##ModuleRegistryItem = Registry::add<type>(registry, name)
+#define REGISTER_MODULE(t, r, n)                                               \
+  auto t##Module = Registry::get().registry(r)->add(n, std::make_shared<t>());
 
 // Remove registry-helper macros from the SDK.
 #undef REGISTER

@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,13 +10,15 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <string>
 #include <vector>
 
+#include <boost/noncopyable.hpp>
 #include <boost/property_tree/ptree.hpp>
 
-#include <osquery/database.h>
+#include <osquery/query.h>
 
 namespace osquery {
 
@@ -33,10 +35,11 @@ struct PackStats {
  * Instantiating a new Pack object parses JSON and may throw a
  * boost::property_tree::json_parser::json_parser_error exception
  */
-class Pack {
+class Pack : private boost::noncopyable {
  public:
   Pack(const std::string& name, const boost::property_tree::ptree& tree)
       : Pack(name, "", tree) {}
+
   Pack(const std::string& name,
        const std::string& source,
        const boost::property_tree::ptree& tree) {
@@ -75,7 +78,9 @@ class Pack {
   /// Returns the minimum version that the pack is configured to run on
   const std::string& getVersion() const;
 
-  size_t getShard() const { return shard_; }
+  size_t getShard() const {
+    return shard_;
+  }
 
   /// Returns the schedule dictated by the pack
   const std::map<std::string, ScheduledQuery>& getSchedule() const;
@@ -94,6 +99,14 @@ class Pack {
 
   /// Verify that a given discovery query returns the appropriate results
   bool checkDiscovery();
+
+  /**
+   * @brief Returns whether this pack is executing
+   *
+   * This can be used to determine whether the pack is active, without the
+   * potential side effect of running the associated discovery queries.
+   */
+  bool isActive() const;
 
   const PackStats& getStats() const;
 
@@ -122,6 +135,12 @@ class Pack {
   /// Cached time and result from previous discovery step.
   std::pair<size_t, bool> discovery_cache_;
 
+  /// Aggregate appropriateness of pack for this host.
+  std::atomic<bool> valid_{false};
+
+  /// Whether this pack is active (valid_ && checkDiscovery())
+  std::atomic<bool> active_{false};
+
   /// Pack discovery statistics.
   PackStats stats_;
 
@@ -131,7 +150,7 @@ class Pack {
    *
    * Initialization must include pack content
    */
-  Pack(){};
+  Pack() {}
 
  private:
   FRIEND_TEST(PacksTests, test_check_platform);

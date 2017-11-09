@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -15,41 +15,123 @@
 
 #include "osquery/core/conversions.h"
 #include "osquery/events/darwin/iokit.h"
-#include "osquery/tables/system/darwin/iokit_utils.h"
 
 namespace osquery {
+
+const std::string kIOUSBDeviceClassName_ = "IOUSBDevice";
+const std::string kIOPCIDeviceClassName_ = "IOPCIDevice";
+const std::string kIOPlatformExpertDeviceClassName_ = "IOPlatformExpertDevice";
+const std::string kIOACPIPlatformDeviceClassName_ = "IOACPIPlatformDevice";
+const std::string kIOPlatformDeviceClassname_ = "IOPlatformDevice";
 
 REGISTER(IOKitEventPublisher, "event_publisher", "iokit");
 
 struct DeviceTracker : private boost::noncopyable {
  public:
+  explicit DeviceTracker(IOKitEventPublisher* p) : publisher(p) {}
+
+ public:
   IOKitEventPublisher* publisher{nullptr};
   io_object_t notification{0};
-
-  explicit DeviceTracker(IOKitEventPublisher* p) : publisher(p) {}
 };
 
+IOKitPCIProperties::IOKitPCIProperties(const std::string& compatible) {
+  auto properties = osquery::split(compatible, " ");
+  if (properties.size() < 2) {
+    return;
+  }
+
+  size_t prop_index = 0;
+  if (properties[1].find("pci") == 0 && properties[1].find("pciclass") != 0) {
+    // There are two sets of PCI definitions.
+    prop_index = 1;
+  } else if (properties[0].find("pci") != 0) {
+    return;
+  }
+
+  auto vendor = osquery::split(properties[prop_index++], ",");
+  vendor_id = vendor[0].substr(3);
+  model_id = (vendor[1].size() == 3) ? "0" + vendor[1] : vendor[1];
+
+  if (properties[prop_index].find("pciclass") == 0) {
+    // There is a class definition.
+    pci_class = properties[prop_index++].substr(9);
+  }
+
+  if (properties.size() > prop_index) {
+    // There is a driver/ID.
+    driver = properties[prop_index];
+  }
+}
+
+std::string getIOKitProperty(const CFMutableDictionaryRef& details,
+                             const std::string& key) {
+  std::string value;
+
+  // Get a property from the device.
+  auto cfkey = CFStringCreateWithCString(
+      kCFAllocatorDefault, key.c_str(), kCFStringEncodingUTF8);
+  auto property = CFDictionaryGetValue(details, cfkey);
+  CFRelease(cfkey);
+
+  // Several supported ways of parsing IOKit-encoded data.
+  if (property) {
+    if (CFGetTypeID(property) == CFNumberGetTypeID()) {
+      value = stringFromCFNumber((CFDataRef)property);
+    } else if (CFGetTypeID(property) == CFStringGetTypeID()) {
+      value = stringFromCFString((CFStringRef)property);
+    } else if (CFGetTypeID(property) == CFDataGetTypeID()) {
+      value = stringFromCFData((CFDataRef)property);
+    } else if (CFGetTypeID(property) == CFBooleanGetTypeID()) {
+      value = (CFBooleanGetValue((CFBooleanRef)property)) ? "1" : "0";
+    }
+  }
+
+  return value;
+}
+
+long long int getNumIOKitProperty(const CFMutableDictionaryRef& details,
+                                  const std::string& key) {
+  // Get a property from the device.
+  auto cfkey = CFStringCreateWithCString(
+      kCFAllocatorDefault, key.c_str(), kCFStringEncodingUTF8);
+  auto property = CFDictionaryGetValue(details, cfkey);
+  CFRelease(cfkey);
+
+  // Several supported ways of parsing IOKit-encoded data.
+  if (property && CFGetTypeID(property) == CFNumberGetTypeID()) {
+    CFNumberType type = CFNumberGetType((CFNumberRef)property);
+    long long int value;
+    CFNumberGetValue((CFNumberRef)property, type, &value);
+    return value;
+  }
+
+  return 0;
+}
+
 void IOKitEventPublisher::restart() {
+  static std::vector<const std::string*> device_classes = {
+      &kIOUSBDeviceClassName_,
+      &kIOPCIDeviceClassName_,
+      &kIOPlatformExpertDeviceClassName_,
+      &kIOACPIPlatformDeviceClassName_,
+      &kIOPlatformDeviceClassname_,
+  };
+
   if (run_loop_ == nullptr) {
-    // There is no run loop to restart.
     return;
   }
 
   // Remove any existing stream.
   stop();
 
-  port_ = IONotificationPortCreate(kIOMasterPortDefault);
-  // Get a run loop source from the created IOKit notification port.
-  auto run_loop_source = IONotificationPortGetRunLoopSource(port_);
-  CFRunLoopAddSource(run_loop_, run_loop_source, kCFRunLoopDefaultMode);
-
-  std::vector<const std::string*> device_classes = {
-      &tables::kIOUSBDeviceClassName_,
-      &tables::kIOPCIDeviceClassName_,
-      &tables::kIOPlatformExpertDeviceClassName_,
-      &tables::kIOACPIPlatformDeviceClassName_,
-      &tables::kIOPlatformDeviceClassname_,
-  };
+  {
+    WriteLock lock(mutex_);
+    port_ = IONotificationPortCreate(kIOMasterPortDefault);
+    // Get a run loop source from the created IOKit notification port.
+    auto run_loop_source = IONotificationPortGetRunLoopSource(port_);
+    CFRunLoopAddSource(run_loop_, run_loop_source, kCFRunLoopDefaultMode);
+  }
 
   publisher_started_ = false;
   for (const auto& class_name : device_classes) {
@@ -59,13 +141,17 @@ void IOKitEventPublisher::restart() {
 
     // Register attach/detaches (could use kIOPublishNotification).
     // Notification types are defined in IOKitKeys.
-    IOReturn result = IOServiceAddMatchingNotification(
-        port_,
-        kIOFirstMatchNotification,
-        matches,
-        (IOServiceMatchingCallback)deviceAttach,
-        this,
-        &iterator_);
+    IOReturn result = kIOReturnSuccess + 1;
+    {
+      WriteLock lock(mutex_);
+      result = IOServiceAddMatchingNotification(
+          port_,
+          kIOFirstMatchNotification,
+          matches,
+          (IOServiceMatchingCallback)deviceAttach,
+          this,
+          &iterator_);
+    }
     if (result == kIOReturnSuccess) {
       deviceAttach(this, iterator_);
     }
@@ -91,34 +177,34 @@ void IOKitEventPublisher::newEvent(const io_service_t& device,
   CFMutableDictionaryRef details;
   IORegistryEntryCreateCFProperties(
       device, &details, kCFAllocatorDefault, kNilOptions);
-  if (ec->type == tables::kIOUSBDeviceClassName_) {
-    ec->path = tables::getIOKitProperty(details, "USB Address") + ":";
-    ec->path += tables::getIOKitProperty(details, "PortNum");
-    ec->model = tables::getIOKitProperty(details, "USB Product Name");
-    ec->model_id = tables::getIOKitProperty(details, "idProduct");
-    ec->vendor = tables::getIOKitProperty(details, "USB Vendor Name");
-    ec->vendor_id = tables::getIOKitProperty(details, "idVendor");
-    tables::idToHex(ec->vendor_id);
-    tables::idToHex(ec->model_id);
-    ec->serial = tables::getIOKitProperty(details, "USB Serial Number");
+  if (ec->type == kIOUSBDeviceClassName_) {
+    ec->path = getIOKitProperty(details, "USB Address") + ":";
+    ec->path += getIOKitProperty(details, "PortNum");
+    ec->model = getIOKitProperty(details, "USB Product Name");
+    ec->model_id = getIOKitProperty(details, "idProduct");
+    ec->vendor = getIOKitProperty(details, "USB Vendor Name");
+    ec->vendor_id = getIOKitProperty(details, "idVendor");
+    idToHex(ec->vendor_id);
+    idToHex(ec->model_id);
+    ec->serial = getIOKitProperty(details, "USB Serial Number");
     if (ec->serial.size() == 0) {
-      ec->serial = tables::getIOKitProperty(details, "iSerialNumber");
+      ec->serial = getIOKitProperty(details, "iSerialNumber");
     }
     ec->version = "";
-    ec->driver = tables::getIOKitProperty(details, "IOUserClientClass");
-  } else if (ec->type == tables::kIOPCIDeviceClassName_) {
-    auto compatible = tables::getIOKitProperty(details, "compatible");
-    auto properties = tables::IOKitPCIProperties(compatible);
+    ec->driver = getIOKitProperty(details, "IOUserClientClass");
+  } else if (ec->type == kIOPCIDeviceClassName_) {
+    auto compatible = getIOKitProperty(details, "compatible");
+    auto properties = IOKitPCIProperties(compatible);
     ec->model_id = properties.model_id;
     ec->vendor_id = properties.vendor_id;
     ec->driver = properties.driver;
     if (ec->driver.empty()) {
-      ec->driver = tables::getIOKitProperty(details, "IOName");
+      ec->driver = getIOKitProperty(details, "IOName");
     }
 
-    ec->path = tables::getIOKitProperty(details, "pcidebug");
-    ec->version = tables::getIOKitProperty(details, "revision-id");
-    ec->model = tables::getIOKitProperty(details, "model");
+    ec->path = getIOKitProperty(details, "pcidebug");
+    ec->version = getIOKitProperty(details, "revision-id");
+    ec->model = getIOKitProperty(details, "model");
   } else {
     // Get the name as the model.
     io_name_t name = {0};
@@ -140,7 +226,7 @@ void IOKitEventPublisher::deviceAttach(void* refcon, io_iterator_t iterator) {
   while ((device = IOIteratorNext(iterator))) {
     // Create a notification tracker.
     {
-      std::lock_guard<std::mutex> lock(self->notification_mutex_);
+      WriteLock lock(self->mutex_);
       auto tracker = std::make_shared<struct DeviceTracker>(self);
       self->devices_.push_back(tracker);
       IOServiceAddInterestNotification(self->port_,
@@ -174,14 +260,15 @@ void IOKitEventPublisher::deviceDetach(void* refcon,
   IOObjectRelease(device);
 
   {
-    std::lock_guard<std::mutex> lock(self->notification_mutex_);
+    WriteLock lock(self->mutex_);
     // Remove the device tracker.
     IOObjectRelease(tracker->notification);
     auto it = self->devices_.begin();
     while (it != self->devices_.end()) {
       if ((*it)->notification == tracker->notification) {
+        IOObjectRelease((*it)->notification);
         self->devices_.erase(it);
-        return;
+        break;
       }
       it++;
     }
@@ -198,9 +285,6 @@ Status IOKitEventPublisher::run() {
 
   // Start the run loop, it may be removed with a tearDown.
   CFRunLoopRun();
-
-  // Add artificial latency to run loop.
-  osquery::publisherSleep(1000);
   return Status(0, "OK");
 }
 
@@ -218,10 +302,32 @@ bool IOKitEventPublisher::shouldFire(const IOKitSubscriptionContextRef& sc,
 }
 
 void IOKitEventPublisher::stop() {
-  // Stop the run loop.
-  if (run_loop_ != nullptr) {
-    CFRunLoopStop(run_loop_);
+  if (run_loop_ == nullptr) {
+    // If there is no run loop then the publisher thread has not started.
+    return;
   }
+
+  // Stop the run loop.
+  WriteLock lock(mutex_);
+  CFRunLoopStop(run_loop_);
+
+  // Stop the run loop before operating on containers.
+  // Destroy the IOPort.
+  if (port_ != nullptr) {
+    auto source = IONotificationPortGetRunLoopSource(port_);
+    if (CFRunLoopContainsSource(run_loop_, source, kCFRunLoopDefaultMode)) {
+      CFRunLoopRemoveSource(run_loop_, source, kCFRunLoopDefaultMode);
+    }
+    // And destroy the port.
+    IONotificationPortDestroy(port_);
+    port_ = nullptr;
+  }
+
+  // Clear all devices and their notifications.
+  for (const auto& device : devices_) {
+    IOObjectRelease(device->notification);
+  }
+  devices_.clear();
 }
 
 void IOKitEventPublisher::tearDown() {

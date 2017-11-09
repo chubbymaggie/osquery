@@ -1,5 +1,5 @@
 /*
- *  Copyright (c) 2014, Facebook, Inc.
+ *  Copyright (c) 2014-present, Facebook, Inc.
  *  All rights reserved.
  *
  *  This source code is licensed under the BSD-style license found in the
@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include <unordered_map>
+#include <boost/noncopyable.hpp>
 
 #include <osquery/tables.h>
 
@@ -20,42 +20,43 @@
 namespace osquery {
 
 /**
- * @brief osquery virtual table connection.
+ * @brief A protection around concurrent table attach requests.
  *
- * This object is the SQLite database's virtual table context.
- * When the virtual table is created/connected the name and columns are
- * retrieved via the TablePlugin call API. The details are kept in this context
- * so column parsing and row walking does not require additional Registry calls.
- *
- * When tables are accessed as the result of an SQL statement a QueryContext is
- * created to represent metadata that can be used by the virtual table
- * implementation code. Thus the code that generates rows can choose to emit
- * additional data, restrict based on constraints, or potentially yield from
- * a cache or choose not to generate certain columns.
+ * Table attaching is not concurrent. Attaching is the only unprotected SQLite
+ * operation from osquery's usage perspective. The extensions API allows for
+ * concurrent access of non-thread-safe database resources for attaching table
+ * schema and filter routing instructions.
  */
-struct VirtualTableContent {
-  /// Friendly name for the table.
-  TableName name;
-  /// Table column structure, retrieved once via the TablePlugin call API.
-  TableColumns columns;
-  /// Transient set of virtual table access constraints.
-  std::unordered_map<size_t, ConstraintSet> constraints;
-};
+extern RecursiveMutex kAttachMutex;
 
 /**
  * @brief osquery cursor object.
  *
  * Only used in the SQLite virtual table module methods.
  */
-struct BaseCursor {
+struct BaseCursor : private boost::noncopyable {
+ public:
   /// SQLite virtual table cursor.
   sqlite3_vtab_cursor base;
+
   /// Track cursors for optional planner output.
   size_t id{0};
+
   /// Table data generated from last access.
   QueryData data;
+
+  /// Callable generator.
+  std::unique_ptr<RowGenerator::pull_type> generator{nullptr};
+
+  /// Results of current call.
+  Row current;
+
+  /// Does the backing local table use a generator type.
+  bool uses_generator{false};
+
   /// Current cursor position.
   size_t row{0};
+
   /// Total number of rows.
   size_t n{0};
 };
@@ -66,19 +67,43 @@ struct BaseCursor {
  * Only used in the SQLite virtual table module methods.
  * This adds each table plugin class to the state tracking in SQLite.
  */
-struct VirtualTable {
+struct VirtualTable : private boost::noncopyable {
+  /// The SQLite-provided virtual table structure.
   sqlite3_vtab base;
-  VirtualTableContent *content{nullptr};
+
+  /// Added structure: A content structure with metadata about the table.
+  VirtualTableContent* content{nullptr};
+
+  /// Added structure: The thread-local DB instance associated with the query.
+  SQLiteDBInstance* instance{nullptr};
 };
 
 /// Attach a table plugin name to an in-memory SQLite database.
-Status attachTableInternal(const std::string &name,
-                           const std::string &statement,
-                           sqlite3 *db);
+Status attachTableInternal(const std::string& name,
+                           const std::string& statement,
+                           const SQLiteDBInstanceRef& instance);
 
 /// Detach (drop) a table.
-Status detachTableInternal(const std::string &name, sqlite3 *db);
+Status detachTableInternal(const std::string& name,
+                           const SQLiteDBInstanceRef& instance);
+
+Status attachFunctionInternal(
+    const std::string& name,
+    std::function<
+        void(sqlite3_context* context, int argc, sqlite3_value** argv)> func);
 
 /// Attach all table plugins to an in-memory SQLite database.
-void attachVirtualTables(sqlite3 *db);
+void attachVirtualTables(const SQLiteDBInstanceRef& instance);
+
+#if !defined(OSQUERY_EXTERNAL)
+/**
+ * A generated foreign amalgamation file includes schema for all tables.
+ *
+ * When the build system generates TablePlugin%s from the .table spec files, it
+ * reads the foreign-platform tables and generates an associated schema plugin.
+ * These plugins are amalgamated into 'foreign_amalgamation' and do not call
+ * their filter generation functions.
+ */
+void registerForeignTables();
+#endif
 }
